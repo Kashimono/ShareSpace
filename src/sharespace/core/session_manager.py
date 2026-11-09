@@ -336,6 +336,18 @@ class SessionManager:
             self._refresh_count()
             return participant.view()
 
+    def authenticate_http_participant(self, participant_token: str) -> ParticipantView:
+        """Authenticate HTTP file requests without promoting a disconnected peer."""
+        with self._lock:
+            self._active_session()
+            participant = self._participant_for_token(participant_token)
+            if (
+                participant.role is not ParticipantRole.PARTICIPANT
+                or participant.status is not ParticipantStatus.CONNECTED
+            ):
+                raise InvalidCredential("Participant is not connected.")
+            return participant.view()
+
     def heartbeat(self, participant_token: str, *, now: datetime | None = None) -> ParticipantView:
         current = now or self._now()
         with self._lock:

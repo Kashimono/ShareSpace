@@ -1,6 +1,7 @@
 # ShareSpace architecture
 
-Version 0.3.0 adds a local session layer above the Version 0.2 platform adapters.
+Version 0.4.0 adds a local file-sharing layer above the Version 0.3 session layer and
+Version 0.2 platform adapters.
 The existing Windows and Linux hotspot implementations remain separate and are not
 used by the session state machine. Hosting on an existing local network is also
 supported so session work can be exercised when a platform cannot create a hotspot.
@@ -15,6 +16,11 @@ supported so session work can be exercised when a platform cannot create a hotsp
   creates IDs and credentials, validates join codes, records requests and participants,
   enforces host-only operations, handles heartbeats, and expires stale state. It has no
   Qt or network dependency.
+- `sharespace.core.file_manager.SharedDirectoryManager` owns one host-selected root,
+  accepts only relative protocol paths, filters hidden items, rejects symbolic links
+  and Windows reparse points, and checks resolved paths stay inside the root.
+- `sharespace.core.transfer_manager.TransferManager` tracks transfer byte counts,
+  status, cancellation, and a bounded in-memory history. It stores no file content.
 - `sharespace.core.device_manager.DeviceManager` reports the device name, OS, and usable
   local IPv4 addresses. It prefers the hotspot address when the user selected the
   existing hotspot workflow. It never chooses a globally routable address as the host
@@ -34,6 +40,12 @@ supported so session work can be exercised when a platform cannot create a hotsp
   heartbeat every five seconds and reconnect after temporary transport failures.
 - `sharespace.networking.session_server.EventBroker` fans out session events to
   connected WebSocket clients and allows one live WebSocket per participant identity.
+- `sharespace.networking.file_service.FileService` attaches to each session server
+  and owns root settings, upload state, temporary uploads, and streaming operations.
+- `sharespace.networking.file_routes` adds authenticated browse, metadata, download,
+  upload, transfer status, and cancellation routes to the FastAPI app.
+- `sharespace.networking.file_client.FileClient` streams files and creates local
+  downloads without replacing existing files.
 
 ### Qt presentation
 
@@ -44,7 +56,12 @@ supported so session work can be exercised when a platform cannot create a hotsp
   requests, and participant states. It performs approval, rejection, disconnect, and
   session teardown.
 - `SessionJoinDialog` discovers sessions, supports a manual local IPv4 address and
-  port, submits a join request, polls approval status, and monitors the WebSocket.
+  port, submits a join request, polls approval status, monitors the WebSocket, and
+  opens the authenticated participant file browser when connected.
+- `FileBrowserDialog` displays relative contents, downloads, optional uploads,
+  transfer progress, and cancellation controls.
+- `SessionHostDialog` selects or stops the shared root, controls uploads (off by
+  default), and displays or cancels active transfers.
 - `sharespace.ui.session_workers` runs blocking setup and asynchronous network work in
   Qt worker threads. The presentation thread handles only widget updates and cached
   discovery snapshots.
@@ -120,6 +137,17 @@ Validation errors omit submitted input values so a joining code is not echoed.
 | `POST /api/v1/host/join-requests/{request_id}/reject` | Reject one pending request | Host bearer token |
 | `POST /api/v1/host/participants/{participant_id}/disconnect` | Revoke a connected participant | Host bearer token |
 | `POST /api/v1/host/end` | End the session | Host bearer token |
+| `GET /api/v1/files/settings` | Read shared folder name and upload availability | Connected participant token |
+| `GET /api/v1/files?path=...` | Browse one relative directory | Connected participant token |
+| `GET /api/v1/files/info?path=...` | Read file metadata | Connected participant token |
+| `GET /api/v1/files/download?path=...` | Stream one file up to 20,000,000 bytes | Connected participant token |
+| `POST /api/v1/files/upload?path=...` | Stream a new file into a relative directory | Connected participant token; uploads enabled |
+| `GET /api/v1/files/transfers` | Read this participant's transfer state | Connected participant token |
+| `POST /api/v1/files/transfers/{transfer_id}/cancel` | Cancel this participant's transfer | Connected participant token |
+| `GET /api/v1/host/files/state` | Read host-side sharing state | Host bearer token |
+| `POST /api/v1/host/files/uploads` | Enable or disable uploads | Host bearer token |
+| `GET /api/v1/host/files/transfers` | Read all session transfer states | Host bearer token |
+| `POST /api/v1/host/files/transfers/{transfer_id}/cancel` | Cancel any transfer | Host bearer token |
 
 Bearer tokens are sent in the HTTP `Authorization` header. The WebSocket endpoint is
 `/api/v1/sessions/{session_id}/events`. After connecting, the client must send:
@@ -162,7 +190,17 @@ does not accept globally routable addresses.
   participant identity.
 - The server disables access logs, and validation errors do not return request bodies.
   The app stores active state only in memory and does not write joining codes to logs.
-- HTTP and WebSocket traffic are **not encrypted** in Version 0.3.0. Devices sharing
+- File requests require an approved, currently connected participant token. Host
+  settings and transfer controls require the host token. The shared absolute path is
+  exposed only to the host UI; participant responses use relative paths and the shared
+  directory name.
+- Symbolic links and reparse points are not followed. Hidden entries are not listed or
+  served. Uploads use a same-directory temporary file, enforce declared and actual
+  sizes, and atomically create a destination only if its name is still unused.
+- Each file is limited to 20,000,000 bytes. Uploads are disabled at session start.
+  Transfer history is bounded and held only in memory. The file service does not
+  modify or delete existing shared files.
+- HTTP and WebSocket traffic are **not encrypted** in Version 0.4.0. Devices sharing
   an untrusted local network may be able to observe traffic. TLS, stronger peer
   identity, and broader security review are future work.
 - mDNS may be blocked by host firewalls, access-point client isolation, VLANs, or
@@ -177,4 +215,7 @@ does not accept globally routable addresses.
   transport and the discovery entry expires after its TTL/stale timeout. OS hotspot
   cleanup after a process crash remains subject to the Version 0.2 adapter limitations.
 
-This milestone contains no file browsing or transfer routes.
+File transfers stream in 64 KiB chunks. Uploads use a raw octet stream rather than
+multipart form parsing, so no separate multipart dependency is required. The host
+selects the shared root locally; session discovery metadata never advertises the folder
+path or file contents.

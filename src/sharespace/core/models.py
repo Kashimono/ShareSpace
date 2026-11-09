@@ -34,6 +34,24 @@ class JoinRequestStatus(StrEnum):
     EXPIRED = "expired"
 
 
+class FileItemType(StrEnum):
+    FILE = "file"
+    DIRECTORY = "directory"
+
+
+class TransferDirection(StrEnum):
+    UPLOAD = "UPLOAD"
+    DOWNLOAD = "DOWNLOAD"
+
+
+class TransferStatus(StrEnum):
+    QUEUED = "QUEUED"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
 class PublicSession(BaseModel):
     """Session data safe to expose to nearby devices."""
 
@@ -135,3 +153,46 @@ class HostSnapshot(BaseModel):
 class ApiError(BaseModel):
     detail: str
     code: str
+
+
+class FileItem(BaseModel):
+    filename: str
+    relative_path: str
+    extension: str
+    size_bytes: int = Field(ge=0)
+    modified_at: datetime
+    item_type: FileItemType
+    accessible: bool = True
+    unavailable_reason: str | None = None
+
+
+class DirectoryListing(BaseModel):
+    directory_path: str
+    parent_path: str | None
+    shared_directory_name: str
+    items: list[FileItem]
+
+
+class SharedDirectoryState(BaseModel):
+    shared: bool
+    available: bool
+    directory_name: str | None = None
+    uploads_enabled: bool = False
+
+
+class UploadSettingUpdate(BaseModel):
+    enabled: bool
+
+
+class TransferView(BaseModel):
+    transfer_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    filename: str
+    direction: TransferDirection
+    total_bytes: int = Field(ge=0)
+    transferred_bytes: int = Field(ge=0)
+    progress_percent: float = Field(ge=0, le=100)
+    status: TransferStatus
+    started_at: datetime
+    completed_at: datetime | None = None
+    error: str | None = None
+    participant_id: str

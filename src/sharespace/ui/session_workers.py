@@ -17,6 +17,7 @@ class SessionWorkerSignals(QObject):
     failed = Signal(str)
     event = Signal(object)
     connection_state = Signal(str)
+    progress = Signal(object)
 
 
 class SessionWorker(QRunnable):

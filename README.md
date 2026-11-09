@@ -1,8 +1,8 @@
 # ShareSpace
 
 ShareSpace is an offline-first local file-sharing application for Windows and Linux.
-Version 0.3.0 adds temporary sessions, local discovery, join approval, and participant
-monitoring. File browsing and file transfer are future milestones and are not included.
+Version 0.4.0 adds authenticated browsing, downloads, and optional uploads for a
+host-selected directory.
 
 ## Development setup
 
@@ -35,13 +35,26 @@ The host can approve or reject requests, view participant roles and connection s
 disconnect a connected participant, and end the session. WebSocket heartbeats detect
 stale connections. Session state and credentials exist only in process memory.
 
+## Share files in a session
+
+After starting a session, the host chooses one directory from the session dashboard.
+Participants can browse and download its files after the host approves them and their
+session connection is active. Uploads are disabled by default; the host can enable or
+disable them at any time. Each file is limited to 20,000,000 bytes (20 MB decimal).
+Uploads create new files only and fail if the destination name already exists.
+
+Paths shown to participants are relative to the shared directory. Hidden files and
+symbolic links are excluded, traversal outside the selected directory is rejected, and
+the selected root stays on the host. The file service does not create folders, delete
+files, synchronize changes, or preserve transfer history after a session ends.
+
 ## Dependencies and local transport
 
 Runtime dependencies are PySide6, FastAPI, Uvicorn, HTTPX, WebSockets, Zeroconf,
-psutil, and Pydantic. Network traffic stays on the local network. Session requests use
-HTTP and real-time events use WebSockets. This milestone does not encrypt that traffic;
-do not describe the protocol as end-to-end encrypted. Broader encryption and identity
-work remains for a later security milestone.
+psutil, and Pydantic. Network traffic stays on the local network. Session and file
+requests use HTTP, real-time events use WebSockets, and file contents stream in bounded
+chunks. Traffic is not encrypted; use trusted local networks. TLS and stronger identity
+work are later security milestones.
 
 Windows hotspot control retains the Version 0.2 limitation: the current unpackaged
 development install lacks the required `wiFiControl` package capability, and the
@@ -55,11 +68,10 @@ Run the suite with:
 
     python -m pytest -q
 
-The session tests exercise the state machine, HTTP/WebSocket routes, validation,
-credential checks, mDNS data parsing, deduplication, and stale-entry handling. The
-discovery tests use fake Zeroconf records. A loopback integration test exercises the
-embedded Uvicorn server and WebSocket stack. These tests do not verify two physical
-devices, multicast reachability, firewall behavior, or hotspot connectivity.
+The suite exercises session state and HTTP/WebSocket routes, mDNS parsing, file path
+confinement, authentication, transfer limits and cancellation, and loopback file
+transfers through the embedded server. It does not verify two physical devices,
+multicast reachability, firewall behavior, or hotspot connectivity.
 
 See [docs/architecture.md](docs/architecture.md) for module boundaries and API
 messages, and [docs/networking-tests.md](docs/networking-tests.md) for test results,

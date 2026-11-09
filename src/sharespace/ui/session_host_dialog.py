@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from PySide6.QtCore import Qt, QThreadPool, QTimer
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -23,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from sharespace.core.device_manager import DeviceManager
-from sharespace.core.models import HostSnapshot, ParticipantRole, ParticipantStatus, PublicSession
+from sharespace.core.models import HostSnapshot, ParticipantRole, ParticipantStatus, PublicSession, TransferStatus
 from sharespace.networking.discovery import SessionAdvertiser
 from sharespace.networking.session_client import SessionClient, SessionClientError
 from sharespace.networking.session_server import SessionServer
@@ -70,8 +72,8 @@ class SessionHostDialog(QDialog):
         self._close_after_end = False
 
         self.setWindowTitle("ShareSpace host session")
-        self.setMinimumSize(760, 650)
-        self.resize(880, 760)
+        self.setMinimumSize(780, 780)
+        self.resize(920, 900)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
@@ -106,6 +108,41 @@ class SessionHostDialog(QDialog):
         details.addRow("Host address", self._address_label)
         details.addRow("Participants", self._count_label)
         layout.addLayout(details)
+
+        sharing = QFormLayout()
+        self._shared_path = QLabel("No folder selected")
+        self._shared_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._shared_path.setWordWrap(True)
+        folder_actions = QHBoxLayout()
+        self._select_folder_button = QPushButton("Select shared folder")
+        self._select_folder_button.clicked.connect(lambda _checked=False: self._choose_shared_folder())
+        self._stop_sharing_button = QPushButton("Stop sharing")
+        self._stop_sharing_button.clicked.connect(lambda _checked=False: self._stop_sharing())
+        folder_actions.addWidget(self._select_folder_button)
+        folder_actions.addWidget(self._stop_sharing_button)
+        folder_widget = QWidget()
+        folder_widget.setLayout(folder_actions)
+        self._uploads_checkbox = QCheckBox("Allow participants to upload files (off by default)")
+        self._uploads_checkbox.toggled.connect(self._toggle_uploads)
+        self._file_status = QLabel("Choose a folder to share files with connected participants.")
+        self._file_status.setWordWrap(True)
+        sharing.addRow("Shared folder", self._shared_path)
+        sharing.addRow("", folder_widget)
+        sharing.addRow("", self._uploads_checkbox)
+        sharing.addRow("File sharing", self._file_status)
+        layout.addLayout(sharing)
+
+        transfer_header = QHBoxLayout()
+        transfer_header.addWidget(QLabel("File transfers"))
+        transfer_header.addStretch(1)
+        self._cancel_transfer_button = QPushButton("Cancel selected transfer")
+        self._cancel_transfer_button.clicked.connect(lambda _checked=False: self._cancel_transfer())
+        transfer_header.addWidget(self._cancel_transfer_button)
+        layout.addLayout(transfer_header)
+        self._transfers = QListWidget()
+        self._transfers.setMaximumHeight(110)
+        self._transfers.currentItemChanged.connect(lambda _current, _previous: self._update_actions())
+        layout.addWidget(self._transfers)
 
         lists = QHBoxLayout()
         pending_column = QVBoxLayout()
@@ -147,6 +184,9 @@ class SessionHostDialog(QDialog):
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(1500)
         self._refresh_timer.timeout.connect(self._refresh_snapshot)
+        self._file_timer = QTimer(self)
+        self._file_timer.setInterval(750)
+        self._file_timer.timeout.connect(self._refresh_file_state)
         QTimer.singleShot(0, self._start_session)
         self._update_actions()
 
@@ -222,7 +262,9 @@ class SessionHostDialog(QDialog):
             self._status.setStyleSheet("color: #157347; font-weight: 600;")
         self._start_event_stream()
         self._refresh_timer.start()
+        self._file_timer.start()
         self._refresh_snapshot()
+        self._refresh_file_state()
         self._update_actions()
 
     def _session_start_failed(self, message: str) -> None:
@@ -328,6 +370,104 @@ class SessionHostDialog(QDialog):
         if self._runtime is not None:
             self._status.setText(f"Session active; could not refresh participant state: {message}")
 
+    def _choose_shared_folder(self) -> None:
+        runtime = self._runtime
+        if runtime is None or self._busy:
+            return
+        selected = QFileDialog.getExistingDirectory(self, "Choose a folder to share")
+        if not selected:
+            return
+        self._busy = True
+        self._file_status.setText("Opening the selected folder for file sharing…")
+        self._update_actions()
+        worker = SessionWorker(lambda: runtime.server.file_service.select_root(selected))
+        worker.signals.finished.connect(lambda _result: self._shared_folder_changed())
+        worker.signals.failed.connect(self._shared_folder_failed)
+        self._thread_pool.start(worker)
+
+    def _shared_folder_changed(self) -> None:
+        self._busy = False
+        self._refresh_file_state()
+        self._update_actions()
+
+    def _shared_folder_failed(self, message: str) -> None:
+        self._busy = False
+        self._file_status.setText(f"Could not share that folder: {message}")
+        self._update_actions()
+
+    def _stop_sharing(self) -> None:
+        runtime = self._runtime
+        if runtime is None or self._busy:
+            return
+        runtime.server.file_service.stop_sharing()
+        self._uploads_checkbox.blockSignals(True)
+        self._uploads_checkbox.setChecked(False)
+        self._uploads_checkbox.blockSignals(False)
+        self._refresh_file_state()
+        self._update_actions()
+
+    def _toggle_uploads(self, enabled: bool) -> None:
+        runtime = self._runtime
+        if runtime is None:
+            return
+        try:
+            runtime.server.file_service.set_uploads_enabled(enabled)
+        except Exception as error:
+            self._file_status.setText(f"Could not update upload access: {error}")
+            self._uploads_checkbox.blockSignals(True)
+            self._uploads_checkbox.setChecked(False)
+            self._uploads_checkbox.blockSignals(False)
+            return
+        self._refresh_file_state()
+
+    def _refresh_file_state(self) -> None:
+        runtime = self._runtime
+        if runtime is None:
+            return
+        service = runtime.server.file_service
+        root = service.directories.root
+        self._shared_path.setText(str(root) if root is not None else "No folder selected")
+        self._uploads_checkbox.blockSignals(True)
+        self._uploads_checkbox.setChecked(service.uploads_enabled)
+        self._uploads_checkbox.blockSignals(False)
+        if root is None:
+            self._file_status.setText("File sharing is off. Select a folder to begin.")
+        else:
+            upload_text = "Uploads are enabled." if service.uploads_enabled else "Uploads are disabled."
+            self._file_status.setText(f"Participants can browse and download. {upload_text}")
+        current_id = self._transfers.currentItem().data(Qt.ItemDataRole.UserRole) if self._transfers.currentItem() else None
+        self._transfers.blockSignals(True)
+        self._transfers.clear()
+        selected = None
+        for transfer in service.transfers.list():
+            item = QListWidgetItem(
+                f"{transfer.direction.value.title()} · {transfer.filename} · "
+                f"{transfer.transferred_bytes:,}/{transfer.total_bytes:,} bytes · "
+                f"{transfer.progress_percent:.0f}% · {transfer.status.value.replace('_', ' ').title()}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, transfer.transfer_id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, transfer.status in {
+                TransferStatus.QUEUED, TransferStatus.IN_PROGRESS
+            })
+            self._transfers.addItem(item)
+            if transfer.transfer_id == current_id:
+                selected = item
+        if selected:
+            self._transfers.setCurrentItem(selected)
+        self._transfers.blockSignals(False)
+        self._update_actions()
+
+    def _cancel_transfer(self) -> None:
+        item = self._transfers.currentItem()
+        if item is None or self._runtime is None:
+            return
+        transfer_id = item.data(Qt.ItemDataRole.UserRole)
+        try:
+            self._runtime.server.file_service.transfers.cancel(transfer_id)
+        except LookupError:
+            return
+        self._refresh_file_state()
+
     def _resolve_request(self, approve: bool) -> None:
         item = self._requests.currentItem()
         runtime = self._runtime
@@ -397,6 +537,7 @@ class SessionHostDialog(QDialog):
         self._close_after_end = close_after
         self._stream_stop.set()
         self._refresh_timer.stop()
+        self._file_timer.stop()
         self._status.setText("Ending session and releasing local networking resources…")
         self._update_actions()
 
@@ -464,6 +605,16 @@ class SessionHostDialog(QDialog):
                 and participant_item.data(Qt.ItemDataRole.UserRole + 2) == ParticipantStatus.CONNECTED.value
             )
         self._disconnect_button.setEnabled(can_disconnect)
+        sharing_available = self._runtime is not None and not self._busy
+        self._select_folder_button.setEnabled(sharing_available)
+        root_available = sharing_available and self._runtime.server.file_service.directories.root is not None
+        self._stop_sharing_button.setEnabled(root_available)
+        self._uploads_checkbox.setEnabled(root_available)
+        selected_transfer = self._transfers.currentItem()
+        self._cancel_transfer_button.setEnabled(
+            sharing_available and selected_transfer is not None
+            and bool(selected_transfer.data(Qt.ItemDataRole.UserRole + 1))
+        )
 
     def closeEvent(self, event) -> None:
         if self._busy:
@@ -482,4 +633,5 @@ class SessionHostDialog(QDialog):
             event.ignore()
             return
         self._stream_stop.set()
+        self._file_timer.stop()
         super().closeEvent(event)

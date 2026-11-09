@@ -1,4 +1,4 @@
-# Version 0.3.0 session and networking tests
+# Version 0.4.0 session and file-sharing tests
 
 ## Automated tests
 
@@ -21,11 +21,21 @@ Session tests cover:
   metadata secrecy.
 - Windows-host/Linux-participant and Linux-host/Windows-participant protocol metadata.
 
+File-sharing tests cover:
+
+- Explicit directory selection, relative paths, hidden entries, symbolic links, and
+  traversal rejection.
+- Connected-participant authentication and host-only upload settings.
+- Browse metadata, Unicode filenames, bounded downloads, default-disabled uploads,
+  upload completion, size checks, and no-overwrite behavior.
+- Transfer byte accounting, cancellation ownership, interrupted-upload cleanup, and
+  temporary-file removal, including cancellation while an upload request body stalls.
+
 The API suite uses FastAPI's in-process TestClient; the discovery suite uses fake mDNS
-records. One loopback integration test binds the embedded Uvicorn server and exercises
-HTTP approval, a real WebSocket heartbeat, host disconnect, and teardown. The tests do
-not send multicast on a real interface, traverse a firewall, or verify physical client
-connections.
+records. Two loopback tests bind the embedded Uvicorn server: one exercises HTTP
+approval, a real WebSocket heartbeat, host disconnect, and teardown; the other runs
+FileClient browse, download, and upload operations. The tests do not send multicast on
+a real interface, traverse a firewall, or verify physical client connections.
 
 ## Two-computer test over an existing local network
 
@@ -50,14 +60,21 @@ wireless clients from one another.
    joining code supplied by the host and request access.
 6. On the host, confirm the device and OS shown in Pending join requests, then approve
    the request. Confirm the participant reports Connected and the host count changes.
-7. On the host, select the participant and choose **Disconnect participant**. Confirm
+7. On the host, choose **Select shared folder** and select a test directory. On the
+   participant, choose **Browse Shared Files**, open a subfolder, and download a file
+   no larger than 20 MB. Confirm the saved bytes match the host copy.
+8. Enable uploads on the host. Upload a new file from the participant and confirm it
+   appears in the selected host directory. Try the same filename again and confirm
+   ShareSpace reports a conflict without replacing the existing file. Disable uploads
+   and confirm a further upload is rejected.
+9. On the host, select the participant and choose **Disconnect participant**. Confirm
    the participant sees the disconnection. Start a fresh join request to test approval
    again.
-8. To test approval again after a host disconnect, close and reopen the participant's
+10. To test approval again after a host disconnect, close and reopen the participant's
    Join Session window to start a fresh join request. Then end the session from the host.
    Confirm the participant sees the host-ended event, the server closes, and the session
    disappears from discovery after the service withdrawal is received.
-9. Repeat with Windows hosting and Linux joining, then Linux hosting and Windows
+11. Repeat with Windows hosting and Linux joining, then Linux hosting and Windows
    joining. Windows hotspot capability is not part of this LAN test.
 
 If mDNS is unavailable but the local network permits TCP, manual IP and port connection
@@ -96,9 +113,10 @@ Windows 11 separately.
 
 | Verification type | Status |
 | --- | --- |
-| Session state, API, and WebSocket automated tests | 36 tests pass, including one loopback Uvicorn/WebSocket integration test |
+| Automated suite | 53 passed, 2 skipped; one warning from the current Starlette TestClient/httpx combination |
+| File API and client integration | In-process auth, path, limit, upload/download, and cancellation tests; embedded Uvicorn file transfers verified |
 | Discovery logic and advertisement metadata | Fake Zeroconf records only; no multicast hardware check |
-| Real local server and client protocol | Loopback HTTP and WebSocket lifecycle verified |
+| Real local server and client protocol | Loopback HTTP/WebSocket lifecycle and FileClient browse/upload/download verified |
 | Existing Wi-Fi/LAN with two computers | Not hardware-verified in this milestone |
 | ShareSpace-created Linux hotspot | Mocked tests only; no radio or client connection verified |
 | ShareSpace-created Windows hotspot | Unavailable in this unpackaged build because of the existing `wiFiControl` capability limitation |
@@ -120,5 +138,5 @@ Windows 11 separately.
   an existing LAN with client communication enabled to distinguish that from session
   logic.
 
-This milestone tests session membership only. It does not browse files or transfer
-content.
+This is a manual physical-device test procedure. It was not performed as part of the
+automated verification unless marked below.

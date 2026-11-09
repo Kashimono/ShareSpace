@@ -23,7 +23,9 @@ from PySide6.QtWidgets import (
 from sharespace.core.device_manager import DeviceManager
 from sharespace.core.models import JoinRequestCreated, JoinRequestStatus, PublicSession
 from sharespace.networking.discovery import SessionDiscovery
+from sharespace.networking.file_client import FileClient
 from sharespace.networking.session_client import SessionClient
+from sharespace.ui.file_browser_dialog import FileBrowserDialog
 from sharespace.ui.session_workers import SessionEventWorker, SessionWorker
 
 
@@ -46,6 +48,7 @@ class SessionJoinDialog(QDialog):
         self._participant_token: str | None = None
         self._client_id = uuid.uuid4().hex
         self._participant_id: str | None = None
+        self._participant_connected = False
         self._stream_stop = threading.Event()
         self._stream_worker: SessionEventWorker | None = None
         self._discovery_busy = False
@@ -109,6 +112,9 @@ class SessionJoinDialog(QDialog):
         self._join_button = QPushButton("Request to Join")
         self._join_button.clicked.connect(lambda _checked=False: self._request_to_join())
         action_row.addWidget(self._join_button)
+        self._browse_button = QPushButton("Browse Shared Files")
+        self._browse_button.clicked.connect(lambda _checked=False: self._open_file_browser())
+        action_row.addWidget(self._browse_button)
         layout.addLayout(action_row)
 
         self.discovery_changed.connect(self._update_discovered_sessions)
@@ -377,7 +383,10 @@ class SessionJoinDialog(QDialog):
     def _on_session_event(self, event: object) -> None:
         if event.get("type") == "authenticated":
             self._participant_id = event.get("participant_id")
+            self._participant_connected = True
+            self._update_buttons()
         elif event.get("type") == "session_ended":
+            self._participant_connected = False
             self._poll_timer.stop()
             self._status.setText("The host ended the session.")
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
@@ -385,17 +394,27 @@ class SessionJoinDialog(QDialog):
             event.get("type") == "participant_disconnected"
             and event.get("participant_id") == self._participant_id
         ):
+            self._participant_connected = False
             self._stream_stop.set()
             self._status.setText("The host disconnected this device from the session.")
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
 
     def _on_stream_state(self, state: str) -> None:
         if state == "connected" and self._participant_token:
+            self._participant_connected = True
             self._status.setText("Connected to the ShareSpace session.")
             self._status.setStyleSheet("color: #157347; font-weight: 600;")
         elif state == "disconnected" and self._participant_token:
+            self._participant_connected = False
             self._status.setText("Session connection interrupted; trying to reconnect…")
             self._status.setStyleSheet("color: #9a6700; font-weight: 600;")
+        self._update_buttons()
+
+    def _open_file_browser(self) -> None:
+        if not self._participant_connected or not self._participant_token or self._endpoint is None:
+            return
+        client = FileClient(*self._endpoint, self._participant_token)
+        FileBrowserDialog(client, self).exec()
 
     def _update_buttons(self) -> None:
         can_join = (
@@ -411,6 +430,9 @@ class SessionJoinDialog(QDialog):
         self._host_input.setEnabled(self._request_id is None)
         self._port_input.setEnabled(self._request_id is None)
         self._code_input.setEnabled(self._request_id is None)
+        self._browse_button.setEnabled(
+            self._participant_connected and bool(self._participant_token) and self._endpoint is not None
+        )
 
     def closeEvent(self, event) -> None:
         self._stream_stop.set()

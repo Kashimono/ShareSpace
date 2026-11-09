@@ -16,6 +16,7 @@ from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from sharespace.core.file_manager import FileAccessError
 from sharespace.core.models import (
     ApiError,
     HostSnapshot,
@@ -33,6 +34,9 @@ from sharespace.core.session_manager import (
     SessionManager,
     SessionUnavailable,
 )
+from sharespace.core.transfer_manager import TransferCancelled, TransferNotFound
+from sharespace.networking.file_routes import create_file_router
+from sharespace.networking.file_service import FileService
 
 logger = logging.getLogger(__name__)
 API_PREFIX = "/api/v1"
@@ -77,10 +81,12 @@ def create_session_app(
     manager: SessionManager,
     *,
     event_broker: EventBroker | None = None,
+    file_service: FileService | None = None,
     monitor_interval_seconds: float = 1.0,
 ) -> FastAPI:
     """Build an isolated app instance for one host session or an API test."""
     broker = event_broker or EventBroker()
+    files = file_service or FileService()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -100,7 +106,7 @@ def create_session_app(
 
     app = FastAPI(
         title="ShareSpace Local Session API",
-        version="0.3.0",
+        version="0.4.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -108,6 +114,22 @@ def create_session_app(
     )
     app.state.session_manager = manager
     app.state.event_broker = broker
+    app.state.file_service = files
+
+    @app.exception_handler(FileAccessError)
+    async def file_error_handler(_request: Request, error: FileAccessError) -> JSONResponse:
+        return JSONResponse(
+            status_code=error.status_code,
+            content=ApiError(detail=str(error), code=error.code).model_dump(),
+        )
+
+    @app.exception_handler(TransferNotFound)
+    async def transfer_not_found_handler(_request: Request, _error: TransferNotFound) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": "Transfer not found.", "code": "transfer_not_found"})
+
+    @app.exception_handler(TransferCancelled)
+    async def transfer_cancelled_handler(_request: Request, error: TransferCancelled) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(error), "code": "transfer_cancelled"})
 
     @app.exception_handler(SessionError)
     async def session_error_handler(_request: Request, error: SessionError) -> JSONResponse:
@@ -314,6 +336,7 @@ def create_session_app(
                 if participant is not None:
                     await broker.publish({"type": "participant_disconnected", "participant_id": participant_id})
 
+    app.include_router(create_file_router(manager, files))
     return app
 
 
@@ -322,6 +345,7 @@ class SessionServer:
 
     def __init__(self, manager: SessionManager | None = None, *, ready_timeout: float = 10.0) -> None:
         self.manager = manager or SessionManager()
+        self.file_service = FileService()
         self.ready_timeout = ready_timeout
         self._server: uvicorn.Server | None = None
         self._socket: socket.socket | None = None
@@ -364,7 +388,7 @@ class SessionServer:
             )
             server = uvicorn.Server(
                 uvicorn.Config(
-                    create_session_app(self.manager),
+                    create_session_app(self.manager, file_service=self.file_service),
                     host="0.0.0.0",
                     port=port,
                     log_level="warning",
@@ -416,3 +440,5 @@ class SessionServer:
         self._thread = None
         self._port = None
         self._host_token = None
+        self.file_service.stop_sharing()
+        self.file_service.cleanup()
