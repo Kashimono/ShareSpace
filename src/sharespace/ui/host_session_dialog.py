@@ -67,6 +67,7 @@ class HostSessionDialog(QDialog):
         self._close_after_stop = False
         self._selected_support: SupportCheck | None = None
         self._selected_adapter: WifiAdapter | None = None
+        self._last_network_info: NetworkInfo | None = None
 
         self.setWindowTitle("Host a ShareSpace session")
         self.setMinimumWidth(540)
@@ -81,8 +82,9 @@ class HostSessionDialog(QDialog):
         layout.addWidget(heading)
 
         intro = QLabel(
-            "Creates a local Wi-Fi network. Linux can operate without an internet connection; "
-            "Windows availability depends on its packaging, connection profile, and adapter."
+            "Create a hotspot with the existing platform adapter, or host over a Wi-Fi or wired "
+            "network that is already connected. Linux hotspot availability depends on the radio; "
+            "the current unpackaged Windows build cannot create its hotspot."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color: #647087;")
@@ -111,6 +113,11 @@ class HostSessionDialog(QDialog):
         self._adapter_combo = QComboBox()
         self._adapter_combo.currentIndexChanged.connect(self._adapter_changed)
         form.addRow("Wireless adapter", self._adapter_combo)
+
+        self._session_name_input = QLineEdit("ShareSpace session")
+        self._session_name_input.setMaxLength(80)
+        self._session_name_input.setPlaceholderText("Session name")
+        form.addRow("Session name", self._session_name_input)
         layout.addLayout(form)
 
         self._compatibility_label = QLabel("Checking hardware compatibility…")
@@ -130,6 +137,16 @@ class HostSessionDialog(QDialog):
         action_row.addWidget(self._create_button)
         action_row.addWidget(self._stop_button)
         layout.addLayout(action_row)
+
+        session_row = QHBoxLayout()
+        self._host_lan_button = QPushButton("Host on this network")
+        self._host_lan_button.clicked.connect(lambda _checked=False: self._open_session(False))
+        self._host_hotspot_button = QPushButton("Host using this hotspot")
+        self._host_hotspot_button.clicked.connect(lambda _checked=False: self._open_session(True))
+        self._host_hotspot_button.setEnabled(False)
+        session_row.addWidget(self._host_lan_button)
+        session_row.addWidget(self._host_hotspot_button)
+        layout.addLayout(session_row)
 
         self._network_info_label = QLabel("Network information appears after the hotspot starts.")
         self._network_info_label.setWordWrap(True)
@@ -334,6 +351,9 @@ class HostSessionDialog(QDialog):
         self._ssid_input.setEnabled(not self._busy and not self._active)
         self._password_input.setEnabled(not self._busy and not self._active)
         self._show_password.setEnabled(not self._busy and not self._active)
+        self._session_name_input.setEnabled(not self._busy)
+        self._host_lan_button.setEnabled(not self._busy)
+        self._host_hotspot_button.setEnabled(not self._busy and self._active)
 
     def _create_hotspot(self) -> None:
         support = self._selected_support
@@ -405,12 +425,14 @@ class HostSessionDialog(QDialog):
     def _hotspot_created(self, result: object) -> None:
         status, network_info = result
         self._active = True
+        self._last_network_info = network_info
         self._set_status(status.message or "Hotspot is active.", kind="active")
         self._display_network_info(network_info)
         self._status_timer.start()
         self._update_buttons()
 
     def _display_network_info(self, network_info: NetworkInfo) -> None:
+        self._last_network_info = network_info
         lines = [f"SSID: {self._ssid_input.text()}"]
         if network_info.interface_name:
             lines.append(f"Host interface: {network_info.interface_name}")
@@ -421,6 +443,27 @@ class HostSessionDialog(QDialog):
         else:
             lines.append("Local IP: Windows did not report an address.")
         self._network_info_label.setText("\n".join(lines))
+
+    def _open_session(self, use_hotspot: bool) -> None:
+        """Open the session dashboard over the selected local network."""
+        if self._busy:
+            return
+        preferred_ip = None
+        if use_hotspot:
+            if not self._active:
+                return
+            info = self._last_network_info or self._platform_manager.get_network_info()
+            preferred_ip = info.ipv4_addresses[0] if info.ipv4_addresses else None
+        from sharespace.ui.session_host_dialog import SessionHostDialog
+
+        dialog = SessionHostDialog(
+            session_name=self._session_name_input.text(),
+            preferred_host_ip=preferred_ip,
+            hotspot_manager=self._platform_manager if use_hotspot else None,
+            stop_hotspot_on_end=use_hotspot,
+            parent=self,
+        )
+        dialog.exec()
 
     def _hotspot_creation_failed(self, message: str) -> None:
         self._active = False

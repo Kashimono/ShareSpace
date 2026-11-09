@@ -1,0 +1,421 @@
+"""Join nearby sessions or connect to a host address manually."""
+
+from __future__ import annotations
+
+import ipaddress
+import threading
+import uuid
+
+from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
+from PySide6.QtWidgets import (
+    QDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from sharespace.core.device_manager import DeviceManager
+from sharespace.core.models import JoinRequestCreated, JoinRequestStatus, PublicSession
+from sharespace.networking.discovery import SessionDiscovery
+from sharespace.networking.session_client import SessionClient
+from sharespace.ui.session_workers import SessionEventWorker, SessionWorker
+
+
+class SessionJoinDialog(QDialog):
+    """Discover a session, request access, and monitor approval and connection."""
+
+    discovery_changed = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._thread_pool = QThreadPool(self)
+        self._thread_pool.setMaxThreadCount(4)
+        self._discovery = SessionDiscovery(on_change=self.discovery_changed.emit)
+        self._selected_session: PublicSession | None = None
+        self._endpoint: tuple[str, int] | None = None
+        self._manual_selection = False
+        self._client: SessionClient | None = None
+        self._request_id: str | None = None
+        self._request_token: str | None = None
+        self._participant_token: str | None = None
+        self._client_id = uuid.uuid4().hex
+        self._participant_id: str | None = None
+        self._stream_stop = threading.Event()
+        self._stream_worker: SessionEventWorker | None = None
+        self._discovery_busy = False
+        self._join_busy = False
+        self._poll_busy = False
+
+        self.setWindowTitle("Join a ShareSpace session")
+        self.setMinimumSize(650, 570)
+        self.resize(760, 650)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+        heading = QLabel("Join a session")
+        heading.setStyleSheet("font-size: 22px; font-weight: 700;")
+        layout.addWidget(heading)
+        self._status = QLabel("Discovering sessions on the local network…")
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet("color: #4357c5; font-weight: 600;")
+        layout.addWidget(self._status)
+
+        session_header = QHBoxLayout()
+        session_header.addWidget(QLabel("Available ShareSpace sessions"))
+        session_header.addStretch(1)
+        self._refresh_button = QPushButton("Refresh")
+        self._refresh_button.clicked.connect(lambda _checked=False: self._refresh_discovery())
+        session_header.addWidget(self._refresh_button)
+        layout.addLayout(session_header)
+        self._sessions = QListWidget()
+        self._sessions.currentItemChanged.connect(self._session_selected)
+        layout.addWidget(self._sessions, 1)
+
+        manual_form = QFormLayout()
+        self._host_input = QLineEdit()
+        self._host_input.setPlaceholderText("192.168.1.20")
+        self._port_input = QLineEdit()
+        self._port_input.setPlaceholderText("Host port")
+        self._manual_button = QPushButton("Connect manually")
+        self._manual_button.clicked.connect(lambda _checked=False: self._connect_manually())
+        manual_row = QHBoxLayout()
+        manual_row.addWidget(self._host_input, 1)
+        manual_row.addWidget(self._port_input)
+        manual_row.addWidget(self._manual_button)
+        manual_widget = QWidget()
+        manual_widget.setLayout(manual_row)
+        manual_form.addRow("Host IPv4 address and port", manual_widget)
+        layout.addLayout(manual_form)
+
+        join_form = QFormLayout()
+        self._code_input = QLineEdit()
+        self._code_input.setPlaceholderText("Enter the joining code from the host")
+        self._code_input.setMaxLength(32)
+        self._code_input.textChanged.connect(lambda _text: self._update_buttons())
+        join_form.addRow("Joining code", self._code_input)
+        layout.addLayout(join_form)
+
+        action_row = QHBoxLayout()
+        self._selected_label = QLabel("Select a session or connect manually.")
+        self._selected_label.setWordWrap(True)
+        action_row.addWidget(self._selected_label, 1)
+        self._join_button = QPushButton("Request to Join")
+        self._join_button.clicked.connect(lambda _checked=False: self._request_to_join())
+        action_row.addWidget(self._join_button)
+        layout.addLayout(action_row)
+
+        self.discovery_changed.connect(self._update_discovered_sessions)
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(1500)
+        self._poll_timer.timeout.connect(self._poll_request)
+        self._discovery_timer = QTimer(self)
+        self._discovery_timer.setInterval(1000)
+        self._discovery_timer.timeout.connect(self._update_discovered_sessions)
+        QTimer.singleShot(0, self._start_discovery)
+        self._update_buttons()
+
+    def _start_discovery(self) -> None:
+        if self._discovery_busy:
+            return
+        self._discovery_busy = True
+        self._update_buttons()
+        worker = SessionWorker(self._discovery.start)
+        worker.signals.finished.connect(self._discovery_started)
+        worker.signals.failed.connect(self._discovery_failed)
+        self._thread_pool.start(worker)
+
+    def _discovery_started(self, _result: object) -> None:
+        self._discovery_busy = False
+        self._discovery_timer.start()
+        self._update_discovered_sessions()
+        self._update_buttons()
+
+    def _discovery_failed(self, message: str) -> None:
+        self._discovery_busy = False
+        self._status.setText(
+            f"Automatic discovery is unavailable ({message}). Enter a local host address and port below."
+        )
+        self._status.setStyleSheet("color: #9a6700; font-weight: 600;")
+        self._update_buttons()
+
+    def _refresh_discovery(self) -> None:
+        if self._discovery_busy:
+            return
+        self._discovery_busy = True
+        self._status.setText("Refreshing local session discovery…")
+        self._update_buttons()
+        operation = self._discovery.refresh if self._discovery.active else self._discovery.start
+        worker = SessionWorker(operation)
+        worker.signals.finished.connect(self._discovery_started)
+        worker.signals.failed.connect(self._discovery_failed)
+        self._thread_pool.start(worker)
+
+    def _update_discovered_sessions(self) -> None:
+        sessions = self._discovery.sessions()
+        current_id = self._selected_session.session_id if self._selected_session else None
+        self._sessions.blockSignals(True)
+        self._sessions.clear()
+        selected_row = -1
+        for index, session in enumerate(sessions):
+            item = QListWidgetItem(
+                f"{session.session_name} — {session.host_device_name}\n"
+                f"{session.participant_count} participant(s) · {session.host_ip}:{session.port}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, session)
+            self._sessions.addItem(item)
+            if session.session_id == current_id:
+                selected_row = index
+        if selected_row >= 0:
+            self._sessions.setCurrentRow(selected_row)
+            self._selected_session = sessions[selected_row]
+            self._endpoint = (sessions[selected_row].host_ip, sessions[selected_row].port)
+        elif self._selected_session is not None and not self._manual_selection:
+            self._selected_session = None
+            self._endpoint = None
+            self._selected_label.setText("Select a session or connect manually.")
+            if self._request_id is None:
+                self._status.setText("The selected session is unavailable.")
+                self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+        self._sessions.blockSignals(False)
+        if sessions:
+            if self._status.text().startswith("Discovering") or self._status.text().startswith("Refreshing"):
+                self._status.setText("Session available. Enter its joining code to request access.")
+                self._status.setStyleSheet("color: #157347; font-weight: 600;")
+        elif (
+            self._selected_session is None
+            and self._request_id is None
+            and self._participant_token is None
+        ):
+            if self._discovery.active:
+                self._status.setText("No sessions found yet. You can refresh or connect by host address and port.")
+                self._status.setStyleSheet("color: #647087;")
+        self._update_buttons()
+
+    def _session_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if current is None:
+            return
+        session = current.data(Qt.ItemDataRole.UserRole)
+        if isinstance(session, PublicSession):
+            self._selected_session = session
+            self._endpoint = (session.host_ip, session.port)
+            self._manual_selection = False
+            self._selected_label.setText(
+                f"Selected: {session.session_name} on {session.host_device_name}"
+            )
+            self._update_buttons()
+
+    def _connect_manually(self) -> None:
+        if self._join_busy:
+            return
+        try:
+            host_ip = str(ipaddress.ip_address(self._host_input.text().strip()))
+            parsed_host = ipaddress.ip_address(host_ip)
+            if parsed_host.version != 4:
+                raise ValueError("Manual connection currently supports IPv4 addresses.")
+            if parsed_host.is_global:
+                raise ValueError("Enter an IPv4 address on a local network.")
+            port = int(self._port_input.text().strip())
+            if not 1 <= port <= 65535:
+                raise ValueError("Port must be between 1 and 65535.")
+        except ValueError as error:
+            self._status.setText(str(error) or "Enter a valid local host IPv4 address and port.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+            return
+
+        self._join_busy = True
+        self._status.setText("Checking the ShareSpace host…")
+        self._update_buttons()
+        client = SessionClient(host_ip, port)
+        worker = SessionWorker(lambda: client.get_public_session())
+        worker.signals.finished.connect(lambda result: self._manual_session_found(result, host_ip, port))
+        worker.signals.failed.connect(self._manual_session_failed)
+        self._thread_pool.start(worker)
+
+    def _manual_session_found(self, result: object, host_ip: str, port: int) -> None:
+        self._join_busy = False
+        self._selected_session = result
+        self._endpoint = (host_ip, port)
+        self._manual_selection = True
+        self._selected_label.setText(f"Manual host: {result.session_name} on {result.host_device_name}")
+        self._status.setText("Session available. Enter its joining code to request access.")
+        self._status.setStyleSheet("color: #157347; font-weight: 600;")
+        self._update_buttons()
+
+    def _manual_session_failed(self, message: str) -> None:
+        self._join_busy = False
+        self._status.setText(f"Connection failed: {message}")
+        self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+        self._update_buttons()
+
+    def _request_to_join(self) -> None:
+        session = self._selected_session
+        endpoint = self._endpoint
+        code = self._code_input.text().strip()
+        if session is None or endpoint is None:
+            self._status.setText("Select an available session or connect to a host manually first.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+            return
+        if not code:
+            self._status.setText("Enter the joining code provided by the host.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+            return
+        if self._join_busy or self._request_id is not None:
+            return
+
+        self._join_busy = True
+        self._status.setText("Sending a join request…")
+        self._status.setStyleSheet("color: #4357c5; font-weight: 600;")
+        self._update_buttons()
+        device = DeviceManager()
+        client = SessionClient(*endpoint)
+        operation = lambda: client.request_join(
+            session_id=session.session_id,
+            client_id=self._client_id,
+            device_name=device.hostname,
+            operating_system=device.operating_system,
+            joining_code=code,
+        )
+        worker = SessionWorker(operation)
+        worker.signals.finished.connect(lambda result: self._join_request_created(result, client))
+        worker.signals.failed.connect(self._join_request_failed)
+        self._thread_pool.start(worker)
+
+    def _join_request_created(self, result: object, client: SessionClient) -> None:
+        self._join_busy = False
+        created: JoinRequestCreated = result
+        self._client = client
+        self._request_id = created.request_id
+        self._request_token = created.request_token
+        if created.status is JoinRequestStatus.REJECTED:
+            self._status.setText("The host rejected the previous request from this device.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+        elif created.status is JoinRequestStatus.APPROVED:
+            self._status.setText("Request approved. Connecting to the session…")
+            self._poll_timer.start()
+        else:
+            self._status.setText("Request pending. Waiting for the host to review it…")
+            self._poll_timer.start()
+        self._update_buttons()
+
+    def _join_request_failed(self, message: str) -> None:
+        self._join_busy = False
+        self._status.setText(f"Connection failed: {message}")
+        self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+        self._update_buttons()
+
+    def _poll_request(self) -> None:
+        if self._poll_busy or not self._client or not self._request_id or not self._request_token:
+            return
+        if self._participant_token:
+            self._poll_timer.stop()
+            return
+        self._poll_busy = True
+        worker = SessionWorker(
+            lambda: self._client.poll_join_request(self._request_id, self._request_token)
+        )
+        worker.signals.finished.connect(self._request_status_received)
+        worker.signals.failed.connect(self._request_poll_failed)
+        self._thread_pool.start(worker)
+
+    def _request_status_received(self, result: object) -> None:
+        self._poll_busy = False
+        status = result.status
+        if status is JoinRequestStatus.PENDING:
+            self._status.setText("Request pending. Waiting for the host to review it…")
+        elif status is JoinRequestStatus.APPROVED:
+            if result.participant_token:
+                self._participant_token = result.participant_token
+                self._poll_timer.stop()
+                self._status.setText("Request approved. Connecting to the session…")
+                self._start_event_stream()
+            else:
+                self._status.setText("Request approved. Finishing connection setup…")
+        elif status is JoinRequestStatus.REJECTED:
+            self._poll_timer.stop()
+            self._status.setText("The host rejected your join request.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+        else:
+            self._poll_timer.stop()
+            self._status.setText("The join request expired. Submit a new request to try again.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+        self._update_buttons()
+
+    def _request_poll_failed(self, message: str) -> None:
+        self._poll_busy = False
+        self._status.setText(f"Connection failed while checking the request: {message}")
+        self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+
+    def _start_event_stream(self) -> None:
+        if not self._client or not self._selected_session or not self._participant_token:
+            return
+        if self._stream_worker is not None:
+            self._stream_stop.set()
+        self._stream_stop = threading.Event()
+        client = self._client
+        worker = SessionEventWorker(
+            lambda signals: client.events(
+                session_id=self._selected_session.session_id,
+                token=self._participant_token,
+                stop_event=self._stream_stop,
+                on_event=signals.event.emit,
+                participant=True,
+                on_connection_state=signals.connection_state.emit,
+            )
+        )
+        worker.signals.event.connect(self._on_session_event)
+        worker.signals.connection_state.connect(self._on_stream_state)
+        self._stream_worker = worker
+        self._thread_pool.start(worker)
+
+    def _on_session_event(self, event: object) -> None:
+        if event.get("type") == "authenticated":
+            self._participant_id = event.get("participant_id")
+        elif event.get("type") == "session_ended":
+            self._poll_timer.stop()
+            self._status.setText("The host ended the session.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+        elif (
+            event.get("type") == "participant_disconnected"
+            and event.get("participant_id") == self._participant_id
+        ):
+            self._stream_stop.set()
+            self._status.setText("The host disconnected this device from the session.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+
+    def _on_stream_state(self, state: str) -> None:
+        if state == "connected" and self._participant_token:
+            self._status.setText("Connected to the ShareSpace session.")
+            self._status.setStyleSheet("color: #157347; font-weight: 600;")
+        elif state == "disconnected" and self._participant_token:
+            self._status.setText("Session connection interrupted; trying to reconnect…")
+            self._status.setStyleSheet("color: #9a6700; font-weight: 600;")
+
+    def _update_buttons(self) -> None:
+        can_join = (
+            self._selected_session is not None
+            and self._endpoint is not None
+            and self._request_id is None
+            and not self._join_busy
+            and bool(self._code_input.text().strip())
+        )
+        self._join_button.setEnabled(can_join)
+        self._manual_button.setEnabled(not self._join_busy and self._request_id is None)
+        self._refresh_button.setEnabled(not self._discovery_busy)
+        self._host_input.setEnabled(self._request_id is None)
+        self._port_input.setEnabled(self._request_id is None)
+        self._code_input.setEnabled(self._request_id is None)
+
+    def closeEvent(self, event) -> None:
+        self._stream_stop.set()
+        self._poll_timer.stop()
+        self._discovery_timer.stop()
+        if self._discovery.active:
+            self._thread_pool.start(SessionWorker(self._discovery.stop))
+        super().closeEvent(event)

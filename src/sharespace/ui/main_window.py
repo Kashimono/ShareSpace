@@ -90,9 +90,10 @@ class MainWindow(QMainWindow):
         cards.addWidget(
             self._create_action_card(
                 title="Join a session",
-                description="Connect to a ShareSpace session on a nearby device.",
+                description="Discover or manually connect to a nearby ShareSpace session.",
                 button_text="Join Session",
-                status_text="Joining a session will be available in a later milestone.",
+                status_text="",
+                on_click=self._open_join_session,
             )
         )
         layout.addLayout(cards)
@@ -143,4 +144,10 @@ class MainWindow(QMainWindow):
 
             self._platform_manager = create_platform_manager()
         dialog = HostSessionDialog(self._platform_manager, self)
+        dialog.exec()
+
+    def _open_join_session(self) -> None:
+        from sharespace.ui.session_join_dialog import SessionJoinDialog
+
+        dialog = SessionJoinDialog(self)
         dialog.exec()

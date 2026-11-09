@@ -1,82 +1,124 @@
-# Version 0.2 networking tests
+# Version 0.3.0 session and networking tests
 
 ## Automated tests
 
-Activate the virtual environment and run:
+Install dependencies and run the project suite:
 
     python -m pip install -e ".[dev]"
     python -m pytest -q
 
-The automated suite mocks nmcli, PowerShell, and the Windows tethering backend. It
-covers platform selection, adapter discovery, AP support results, status, local IP
-parsing, failed starts, permission/driver errors, cleanup, and preservation of an
-unrelated active Linux connection. These tests do not control a real radio or prove
-that another device can connect.
+Session tests cover:
 
-## Linux hardware test (Ubuntu/Fedora with NetworkManager)
+- Session and credential generation, unique IDs, code hashing, and host identity.
+- Join-code validation, duplicate-request idempotence, approval and rejection.
+- Participant registration, role/state reporting, heartbeat updates, reconnects, and
+  stale participant expiry.
+- Host authorization, participant disconnect, and session teardown.
+- FastAPI metadata, validation, request polling, and host endpoints.
+- WebSocket authentication, heartbeat acknowledgement, state events, and host
+  termination notification.
+- Fake Zeroconf records, duplicate session advertisements, stale entry removal, and
+  metadata secrecy.
+- Windows-host/Linux-participant and Linux-host/Windows-participant protocol metadata.
 
-1. Confirm NetworkManager is running and nmcli -f WIFI-PROPERTIES.AP device show
-   the-interface-name reports yes for the wireless radio.
-2. If possible, leave the radio disconnected or select a second wireless adapter.
-   ShareSpace will ask before using a radio that is connected to another network.
-3. Run ShareSpace, choose Host Session, enter an SSID and password, select the
-   radio, and run Check Compatibility.
-4. Create the hotspot. Confirm the status changes to Hotspot active and the host
-   local IP is shown. On a second phone or computer, connect to the SSID and enter
-   the configured password.
-5. With no Internet uplink available, verify the client remains connected and can
-   reach the host's displayed local IP. A temporary TCP listener can test local
-   traffic independently of file transfer support:
+The API suite uses FastAPI's in-process TestClient; the discovery suite uses fake mDNS
+records. One loopback integration test binds the embedded Uvicorn server and exercises
+HTTP approval, a real WebSocket heartbeat, host disconnect, and teardown. The tests do
+not send multicast on a real interface, traverse a firewall, or verify physical client
+connections.
 
-       python -c "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('0.0.0.0', 54832)); s.listen(1); c,a=s.accept(); print(a, c.recv(128)); c.sendall(b'local-ok'); c.close(); s.close()"
+## Two-computer test over an existing local network
 
-   From the client, connect to the host IP on TCP port 54832 and send a short
-   message; verify the host prints it and the client receives local-ok. Replace
-   HOST_IP with the address shown by ShareSpace:
+This is the recommended first hardware test because it does not rely on independent
+hotspot creation. Both computers must share a local network that permits client-to-host
+traffic. Internet access is not needed, but a router or access point may still isolate
+wireless clients from one another.
 
-       python -c "import socket; s=socket.create_connection(('HOST_IP', 54832)); s.sendall(b'client-message'); print(s.recv(128)); s.close()"
+1. On both computers, install and launch ShareSpace using the development setup in the
+   README. Use a Windows 10/11 and Linux pair for mixed-platform testing.
+2. Connect both computers to the same local Wi-Fi or wired LAN. For an offline test,
+   use a local network with its Internet uplink disabled while leaving local device
+   communication enabled.
+3. On the host, choose **Host Session**, enter a session name, and select **Host on
+   this network**. The app chooses a local IPv4 address and random port and displays
+   `IP:port`, session ID, and joining code.
+4. If Windows Firewall asks, allow the ShareSpace Python application on the trusted
+   private network. Firewall policy may require an administrator to allow inbound TCP
+   to the displayed port. The port is selected dynamically for each session.
+5. On the participant, choose **Join Session**. Select the discovered session. If no
+   session appears after refresh, enter the host IP and port manually. Enter the
+   joining code supplied by the host and request access.
+6. On the host, confirm the device and OS shown in Pending join requests, then approve
+   the request. Confirm the participant reports Connected and the host count changes.
+7. On the host, select the participant and choose **Disconnect participant**. Confirm
+   the participant sees the disconnection. Start a fresh join request to test approval
+   again.
+8. To test approval again after a host disconnect, close and reopen the participant's
+   Join Session window to start a fresh join request. Then end the session from the host.
+   Confirm the participant sees the host-ended event, the server closes, and the session
+   disappears from discovery after the service withdrawal is received.
+9. Repeat with Windows hosting and Linux joining, then Linux hosting and Windows
+   joining. Windows hotspot capability is not part of this LAN test.
 
-   Allow that local test port through the host firewall if needed.
-6. Stop the hotspot in ShareSpace. Confirm the temporary profile is removed, the
-   hotspot disappears from the client, and the previous Wi-Fi profile returns if it
-   was active before the test and no other profile took its place.
-7. Repeat with the host's Internet/Wi-Fi uplink disabled to verify the hotspot and
-   local client-to-host traffic work offline.
+If mDNS is unavailable but the local network permits TCP, manual IP and port connection
+should still work. If neither device can reach the host, check firewall rules, client
+isolation, VLAN/subnet routing, selected host interface, and whether the host IP is
+reachable from the participant.
 
-NetworkManager reports AP capability from the current radio/driver, but hardware
-firmware and distribution configuration can still reject activation. If
-ipv4.method shared cannot start because required NetworkManager components are
-missing, ShareSpace reports the failure and removes its temporary profile.
+## ShareSpace-created hotspot test
 
-## Windows hardware test
+### Linux
 
-The current Python development install is unpackaged, so the Windows adapter is
-expected to report that the required wiFiControl package capability is unavailable.
-No Windows hotspot has been started or verified on hardware in this milestone.
+Linux hotspot creation still uses the Version 0.2 NetworkManager adapter. On a Linux
+device with a radio/driver that reports AP mode support:
 
-After a future Windows packaging step provides package identity and declares
-wiFiControl, test on Windows 10 and Windows 11 separately:
+1. Open Host Session, select a wireless adapter, check compatibility, configure the
+   SSID and password, and create the hotspot.
+2. After the OS reports the hotspot active, choose **Host using this hotspot**.
+3. Join from a second device and complete the same approval and teardown steps above.
+4. Repeat with the Internet uplink disconnected. Verify host/participant local
+   connectivity, and confirm the hotspot and session stop cleanly.
 
-1. Check that ShareSpace detects the physical Wi-Fi adapter and reports the exact
-   Windows tethering capability result.
-2. Configure the SSID/password, create the hotspot, and confirm that Windows reports
-   tethering active and ShareSpace displays the virtual adapter IP.
-3. Connect a second device and test local host/client communication using the TCP
-   listener steps above.
-4. Disable the host's Internet uplink and repeat. A missing Windows connection
-   profile may prevent this API from starting; that is a real platform limitation
-   and must remain an explicit unsupported result.
-5. Stop the hotspot and confirm it is off. On pre-24H2 Windows, also confirm the
-   original persistent mobile-hotspot SSID/password have been restored.
+This is a manual test procedure only. Linux hotspot creation, client association,
+client isolation behavior, and session traffic have not been hardware-verified in this
+milestone.
 
-Windows 11 24H2 supports per-session configuration. Windows 10 and earlier Windows
-11 versions require temporary changes to the persisted mobile-hotspot configuration
-and restoration on orderly stop. Test those OS paths independently.
+### Windows
 
-## Verification record for this milestone
+The current unpackaged Windows development install lacks the required `wiFiControl`
+package identity/capability, so the existing Version 0.2 adapter reports hotspot
+control unavailable. The session fallback can still be tested on an existing local
+network. Do not treat hosting on the current LAN as proof that Windows hotspot creation
+works. A future packaged build must declare the capability, then test Windows 10 and
+Windows 11 separately.
 
-- Automated mocked tests: see the milestone report for the current count.
-- PyWinRT projections: import/API-shape smoke checked on Windows, but calls requiring
-  package identity and a real radio were not executed.
-- Linux nmcli calls: mocked only; no Linux host was available.
-- Client association and local client/host communication: not hardware-verified.
+## Verification record
+
+| Verification type | Status |
+| --- | --- |
+| Session state, API, and WebSocket automated tests | 36 tests pass, including one loopback Uvicorn/WebSocket integration test |
+| Discovery logic and advertisement metadata | Fake Zeroconf records only; no multicast hardware check |
+| Real local server and client protocol | Loopback HTTP and WebSocket lifecycle verified |
+| Existing Wi-Fi/LAN with two computers | Not hardware-verified in this milestone |
+| ShareSpace-created Linux hotspot | Mocked tests only; no radio or client connection verified |
+| ShareSpace-created Windows hotspot | Unavailable in this unpackaged build because of the existing `wiFiControl` capability limitation |
+| Cross-platform Windows/Linux physical connections | Not verified |
+| Encryption | Not implemented; local HTTP and WebSocket traffic is unencrypted |
+
+## Troubleshooting
+
+- **No sessions appear:** use Refresh, check that multicast/mDNS is allowed, and try
+  manual local IPv4 address and port.
+- **Manual connection fails:** confirm the host still shows an active session, the
+  address is reachable from the participant, and inbound TCP is allowed for the
+  displayed random port.
+- **Join code rejected:** re-enter the host's current code. Codes change when sessions
+  are recreated and are not IP addresses.
+- **Host approves but participant does not connect:** inspect firewall prompts and
+  client isolation. The participant must reach the displayed host address and port.
+- **Hotspot clients cannot join:** some access points isolate associated clients. Use
+  an existing LAN with client communication enabled to distinguish that from session
+  logic.
+
+This milestone tests session membership only. It does not browse files or transfer
+content.

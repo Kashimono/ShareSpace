@@ -1,0 +1,485 @@
+"""Host session dashboard with approval and participant controls."""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from dataclasses import dataclass
+
+from PySide6.QtCore import Qt, QThreadPool, QTimer
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from sharespace.core.device_manager import DeviceManager
+from sharespace.core.models import HostSnapshot, ParticipantRole, ParticipantStatus, PublicSession
+from sharespace.networking.discovery import SessionAdvertiser
+from sharespace.networking.session_client import SessionClient, SessionClientError
+from sharespace.networking.session_server import SessionServer
+from sharespace.platform.platform_manager import PlatformManager
+from sharespace.ui.session_workers import SessionEventWorker, SessionWorker
+
+
+@dataclass
+class _HostRuntime:
+    server: SessionServer
+    advertiser: SessionAdvertiser
+    session: PublicSession
+    joining_code: str
+    host_token: str
+    host_addresses: tuple[str, ...] = ()
+    discovery_error: str | None = None
+
+
+class SessionHostDialog(QDialog):
+    """Start a local session and manage join requests and connected devices."""
+
+    def __init__(
+        self,
+        *,
+        session_name: str,
+        preferred_host_ip: str | None = None,
+        hotspot_manager: PlatformManager | None = None,
+        stop_hotspot_on_end: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._session_name = session_name.strip()
+        self._preferred_host_ip = preferred_host_ip
+        self._hotspot_manager = hotspot_manager
+        self._stop_hotspot_on_end = stop_hotspot_on_end
+        self._runtime: _HostRuntime | None = None
+        self._client: SessionClient | None = None
+        self._thread_pool = QThreadPool(self)
+        self._thread_pool.setMaxThreadCount(4)
+        self._stream_stop = threading.Event()
+        self._stream_worker: SessionEventWorker | None = None
+        self._busy = False
+        self._refresh_busy = False
+        self._close_after_end = False
+
+        self.setWindowTitle("ShareSpace host session")
+        self.setMinimumSize(760, 650)
+        self.resize(880, 760)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+
+        heading = QLabel("Host session")
+        heading.setStyleSheet("font-size: 22px; font-weight: 700;")
+        layout.addWidget(heading)
+        self._status = QLabel("Starting the local session server…")
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet("color: #4357c5; font-weight: 600;")
+        layout.addWidget(self._status)
+
+        details = QFormLayout()
+        self._name_label = QLabel(self._session_name or "ShareSpace session")
+        self._id_label = QLabel("Starting…")
+        self._code_input = QLineEdit()
+        self._code_input.setReadOnly(True)
+        self._copy_code_button = QPushButton("Copy joining code")
+        self._copy_code_button.clicked.connect(lambda _checked=False: self._copy_code())
+        code_row = QHBoxLayout()
+        code_row.addWidget(self._code_input, 1)
+        code_row.addWidget(self._copy_code_button)
+        code_widget = QWidget()
+        code_widget.setLayout(code_row)
+        self._address_label = QLabel("Selecting a local address…")
+        self._address_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._count_label = QLabel("0 connected")
+        details.addRow("Session name", self._name_label)
+        details.addRow("Session ID", self._id_label)
+        details.addRow("Joining code", code_widget)
+        details.addRow("Host address", self._address_label)
+        details.addRow("Participants", self._count_label)
+        layout.addLayout(details)
+
+        lists = QHBoxLayout()
+        pending_column = QVBoxLayout()
+        pending_column.addWidget(QLabel("Pending join requests"))
+        self._requests = QListWidget()
+        self._requests.currentItemChanged.connect(lambda _current, _previous: self._update_actions())
+        pending_column.addWidget(self._requests, 1)
+        request_actions = QHBoxLayout()
+        self._approve_button = QPushButton("Approve")
+        self._approve_button.clicked.connect(lambda _checked=False: self._resolve_request(True))
+        self._reject_button = QPushButton("Reject")
+        self._reject_button.clicked.connect(lambda _checked=False: self._resolve_request(False))
+        request_actions.addWidget(self._approve_button)
+        request_actions.addWidget(self._reject_button)
+        pending_column.addLayout(request_actions)
+
+        participant_column = QVBoxLayout()
+        participant_column.addWidget(QLabel("Participants"))
+        self._participants = QListWidget()
+        self._participants.currentItemChanged.connect(
+            lambda _current, _previous: self._update_actions()
+        )
+        participant_column.addWidget(self._participants, 1)
+        self._disconnect_button = QPushButton("Disconnect participant")
+        self._disconnect_button.clicked.connect(lambda _checked=False: self._disconnect_participant())
+        participant_column.addWidget(self._disconnect_button)
+        lists.addLayout(pending_column, 1)
+        lists.addLayout(participant_column, 1)
+        layout.addLayout(lists, 1)
+
+        footer = QHBoxLayout()
+        self._end_button = QPushButton("End Session")
+        self._end_button.setStyleSheet("background: #b42318; color: white; font-weight: 650;")
+        self._end_button.clicked.connect(lambda _checked=False: self._confirm_end())
+        footer.addStretch(1)
+        footer.addWidget(self._end_button)
+        layout.addLayout(footer)
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(1500)
+        self._refresh_timer.timeout.connect(self._refresh_snapshot)
+        QTimer.singleShot(0, self._start_session)
+        self._update_actions()
+
+    def _start_session(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self._update_actions()
+
+        def start() -> _HostRuntime:
+            device_manager = DeviceManager()
+            address = device_manager.select_host_address(self._preferred_host_ip)
+            if address is None:
+                raise RuntimeError("No usable local IPv4 address is available on this device.")
+            addresses = [address.address] + [
+                item.address
+                for item in device_manager.get_local_addresses()
+                if item.address != address.address
+            ]
+            server = SessionServer()
+            session, joining_code, host_token = server.start(
+                session_name=self._session_name or "ShareSpace session",
+                host_device_name=device_manager.hostname,
+                host_os=device_manager.operating_system,
+                host_ip=address.address,
+            )
+            advertiser = SessionAdvertiser(server.manager, device_manager)
+            discovery_error = None
+            try:
+                advertiser.start()
+            except Exception as error:
+                discovery_error = str(error)
+            return _HostRuntime(
+                server,
+                advertiser,
+                session,
+                joining_code,
+                host_token,
+                tuple(addresses),
+                discovery_error,
+            )
+
+        worker = SessionWorker(start)
+        worker.signals.finished.connect(self._session_started)
+        worker.signals.failed.connect(self._session_start_failed)
+        self._thread_pool.start(worker)
+
+    def _session_started(self, result: object) -> None:
+        self._busy = False
+        self._runtime = result
+        runtime = self._runtime
+        if runtime is None:
+            return
+        self._client = SessionClient(runtime.session.host_ip, runtime.session.port)
+        self._name_label.setText(runtime.session.session_name)
+        self._id_label.setText(runtime.session.session_id)
+        self._code_input.setText(runtime.joining_code)
+        addresses = [
+            f"{address}:{runtime.session.port}" for address in runtime.host_addresses
+        ]
+        if not addresses:
+            addresses = [f"{runtime.session.host_ip}:{runtime.session.port}"]
+        address_text = "\n".join(addresses)
+        self._address_label.setText(address_text)
+        if runtime.discovery_error:
+            self._status.setText(
+                "Session active. Automatic discovery is unavailable; share the address above "
+                "and joining code manually."
+            )
+            self._status.setStyleSheet("color: #9a6700; font-weight: 600;")
+        else:
+            self._status.setText("Session active and advertised on the local network.")
+            self._status.setStyleSheet("color: #157347; font-weight: 600;")
+        self._start_event_stream()
+        self._refresh_timer.start()
+        self._refresh_snapshot()
+        self._update_actions()
+
+    def _session_start_failed(self, message: str) -> None:
+        self._busy = False
+        self._status.setText(f"Could not start the session: {message}")
+        self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+        self._end_button.setText("Close")
+        self._end_button.clicked.disconnect()
+        self._end_button.clicked.connect(lambda _checked=False: self.reject())
+        self._update_actions()
+
+    def _start_event_stream(self) -> None:
+        runtime = self._runtime
+        if runtime is None or self._client is None:
+            return
+        self._stream_stop.clear()
+        worker = SessionEventWorker(
+            lambda signals: self._client.events(
+                session_id=runtime.session.session_id,
+                token=runtime.host_token,
+                stop_event=self._stream_stop,
+                on_event=signals.event.emit,
+                participant=False,
+                on_connection_state=signals.connection_state.emit,
+            )
+        )
+        worker.signals.event.connect(self._on_session_event)
+        worker.signals.connection_state.connect(self._on_stream_state)
+        self._stream_worker = worker
+        self._thread_pool.start(worker)
+
+    def _on_session_event(self, _event: object) -> None:
+        self._refresh_snapshot()
+
+    def _on_stream_state(self, state: str) -> None:
+        if state == "disconnected" and self._runtime is not None:
+            self._status.setText("Session is active; reconnecting to live updates…")
+        elif state == "connected" and self._runtime is not None:
+            if self._runtime.discovery_error:
+                self._status.setText("Session active; automatic discovery is unavailable.")
+            else:
+                self._status.setText("Session active and advertised on the local network.")
+
+    def _refresh_snapshot(self) -> None:
+        if self._refresh_busy or self._client is None or self._runtime is None:
+            return
+        self._refresh_busy = True
+        worker = SessionWorker(lambda: self._client.host_snapshot(self._runtime.host_token))
+        worker.signals.finished.connect(self._snapshot_loaded)
+        worker.signals.failed.connect(self._snapshot_failed)
+        self._thread_pool.start(worker)
+
+    def _snapshot_loaded(self, result: object) -> None:
+        self._refresh_busy = False
+        snapshot: HostSnapshot = result
+        self._count_label.setText(f"{snapshot.session.participant_count} connected")
+        current_request_id = (
+            self._requests.currentItem().data(Qt.ItemDataRole.UserRole)
+            if self._requests.currentItem() is not None
+            else None
+        )
+        current_participant_id = (
+            self._participants.currentItem().data(Qt.ItemDataRole.UserRole)
+            if self._participants.currentItem() is not None
+            else None
+        )
+        self._requests.blockSignals(True)
+        self._requests.clear()
+        selected_request = None
+        for request in snapshot.pending_requests:
+            item = QListWidgetItem(
+                f"{request.device_name} ({request.operating_system})\nRequested {request.requested_at.astimezone().strftime('%H:%M:%S')}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, request.request_id)
+            self._requests.addItem(item)
+            if request.request_id == current_request_id:
+                selected_request = item
+        if selected_request is not None:
+            self._requests.setCurrentItem(selected_request)
+        self._requests.blockSignals(False)
+        self._participants.blockSignals(True)
+        self._participants.clear()
+        selected_participant = None
+        for participant in snapshot.participants:
+            label = (
+                f"{participant.device_name} · {participant.operating_system}\n"
+                f"{participant.role.value.title()} · {participant.status.value.title()}"
+            )
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, participant.participant_id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, participant.role.value)
+            item.setData(Qt.ItemDataRole.UserRole + 2, participant.status.value)
+            self._participants.addItem(item)
+            if participant.participant_id == current_participant_id:
+                selected_participant = item
+        if selected_participant is not None:
+            self._participants.setCurrentItem(selected_participant)
+        self._participants.blockSignals(False)
+        self._update_actions()
+
+    def _snapshot_failed(self, message: str) -> None:
+        self._refresh_busy = False
+        if self._runtime is not None:
+            self._status.setText(f"Session active; could not refresh participant state: {message}")
+
+    def _resolve_request(self, approve: bool) -> None:
+        item = self._requests.currentItem()
+        runtime = self._runtime
+        if item is None or runtime is None or self._client is None or self._busy:
+            return
+        request_id = item.data(Qt.ItemDataRole.UserRole)
+        operation = (
+            self._client.approve_request(request_id, runtime.host_token)
+            if approve
+            else self._client.reject_request(request_id, runtime.host_token)
+        )
+        self._run_action(lambda: operation)
+
+    def _disconnect_participant(self) -> None:
+        item = self._participants.currentItem()
+        runtime = self._runtime
+        if item is None or runtime is None or self._client is None or self._busy:
+            return
+        participant_id = item.data(Qt.ItemDataRole.UserRole)
+        self._run_action(
+            lambda: self._client.disconnect_participant(participant_id, runtime.host_token)
+        )
+
+    def _run_action(self, operation) -> None:
+        self._busy = True
+        self._update_actions()
+        worker = SessionWorker(operation)
+        worker.signals.finished.connect(self._action_finished)
+        worker.signals.failed.connect(self._action_failed)
+        self._thread_pool.start(worker)
+
+    def _action_finished(self, _result: object) -> None:
+        self._busy = False
+        self._refresh_snapshot()
+        self._update_actions()
+
+    def _action_failed(self, message: str) -> None:
+        self._busy = False
+        QMessageBox.warning(self, "Session action failed", message)
+        self._update_actions()
+
+    def _copy_code(self) -> None:
+        code = self._code_input.text()
+        if code:
+            QApplication.clipboard().setText(code)
+            self._status.setText("Joining code copied.")
+
+    def _confirm_end(self) -> None:
+        if self._runtime is None:
+            self.reject()
+            return
+        answer = QMessageBox.question(
+            self,
+            "End ShareSpace session?",
+            "This will disconnect all participants and stop this session. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._end_session(close_after=True)
+
+    def _end_session(self, *, close_after: bool) -> None:
+        runtime = self._runtime
+        if runtime is None or self._busy:
+            return
+        self._busy = True
+        self._close_after_end = close_after
+        self._stream_stop.set()
+        self._refresh_timer.stop()
+        self._status.setText("Ending session and releasing local networking resources…")
+        self._update_actions()
+
+        def cleanup() -> str:
+            failures: list[str] = []
+            if self._client is not None:
+                try:
+                    asyncio.run(self._client.end_session(runtime.host_token))
+                except Exception as error:
+                    failures.append(f"Session notification failed: {error}")
+                    try:
+                        runtime.server.manager.end_session(runtime.host_token)
+                    except Exception:
+                        pass
+            try:
+                runtime.advertiser.stop()
+            except Exception as error:
+                failures.append(f"Discovery cleanup failed: {error}")
+            try:
+                runtime.server.stop()
+            except Exception as error:
+                failures.append(f"Session server cleanup failed: {error}")
+            if self._stop_hotspot_on_end and self._hotspot_manager is not None:
+                try:
+                    self._hotspot_manager.stop_hotspot()
+                except Exception as error:
+                    failures.append(f"Hotspot cleanup failed: {error}")
+            return "\n".join(failures)
+
+        worker = SessionWorker(cleanup)
+        worker.signals.finished.connect(self._end_finished)
+        worker.signals.failed.connect(self._end_failed)
+        self._thread_pool.start(worker)
+
+    def _end_finished(self, failures: object) -> None:
+        self._busy = False
+        self._runtime = None
+        self._client = None
+        if failures:
+            QMessageBox.warning(self, "Session ended with cleanup issues", str(failures))
+        if self._close_after_end:
+            self.accept()
+        else:
+            self._status.setText("Session ended.")
+            self.reject()
+
+    def _end_failed(self, message: str) -> None:
+        self._busy = False
+        QMessageBox.warning(self, "Session cleanup failed", message)
+        if self._close_after_end:
+            self.accept()
+
+    def _update_actions(self) -> None:
+        available = self._runtime is not None and not self._busy
+        self._copy_code_button.setEnabled(available and bool(self._code_input.text()))
+        self._end_button.setEnabled(not self._busy)
+        request_available = available and self._requests.currentItem() is not None
+        self._approve_button.setEnabled(request_available)
+        self._reject_button.setEnabled(request_available)
+        participant_item = self._participants.currentItem()
+        can_disconnect = False
+        if available and participant_item is not None:
+            can_disconnect = (
+                participant_item.data(Qt.ItemDataRole.UserRole + 1) == ParticipantRole.PARTICIPANT.value
+                and participant_item.data(Qt.ItemDataRole.UserRole + 2) == ParticipantStatus.CONNECTED.value
+            )
+        self._disconnect_button.setEnabled(can_disconnect)
+
+    def closeEvent(self, event) -> None:
+        if self._busy:
+            event.ignore()
+            return
+        if self._runtime is not None:
+            answer = QMessageBox.question(
+                self,
+                "End ShareSpace session?",
+                "The session is still active. End it before closing this window?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._end_session(close_after=True)
+            event.ignore()
+            return
+        self._stream_stop.set()
+        super().closeEvent(event)
