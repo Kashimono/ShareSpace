@@ -13,12 +13,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sharespace.platform.platform_manager import PlatformManager
+from sharespace.ui.host_session_dialog import HostSessionDialog
+
 
 class MainWindow(QMainWindow):
     """Present the two session entry points without starting networking."""
 
-    def __init__(self) -> None:
+    def __init__(self, platform_manager: PlatformManager | None = None) -> None:
         super().__init__()
+        self._platform_manager = platform_manager
         self.setWindowTitle("ShareSpace")
         self.setMinimumSize(680, 440)
         self.resize(840, 540)
@@ -77,9 +81,10 @@ class MainWindow(QMainWindow):
         cards.addWidget(
             self._create_action_card(
                 title="Host a session",
-                description="Prepare this device to share with someone nearby.",
+                description="Create a local Wi-Fi network for nearby devices.",
                 button_text="Host Session",
-                status_text="Session hosting will be available in a later milestone.",
+                status_text="",
+                on_click=self._open_host_session,
             )
         )
         cards.addWidget(
@@ -105,6 +110,7 @@ class MainWindow(QMainWindow):
         description: str,
         button_text: str,
         status_text: str,
+        on_click=None,
     ) -> QFrame:
         """Build one entry-point card and connect it to the status line."""
         card = QFrame()
@@ -124,6 +130,17 @@ class MainWindow(QMainWindow):
         card_layout.addStretch(1)
 
         button = QPushButton(button_text)
-        button.clicked.connect(lambda: self._status.setText(status_text))
+        if on_click is not None:
+            button.clicked.connect(lambda _checked=False: on_click())
+        else:
+            button.clicked.connect(lambda _checked=False: self._status.setText(status_text))
         card_layout.addWidget(button)
         return card
+
+    def _open_host_session(self) -> None:
+        if self._platform_manager is None:
+            from sharespace.platform.platform_manager import create_platform_manager
+
+            self._platform_manager = create_platform_manager()
+        dialog = HostSessionDialog(self._platform_manager, self)
+        dialog.exec()
