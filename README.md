@@ -1,7 +1,8 @@
 # ShareSpace
 
 ShareSpace is an offline-first local file-sharing application for Windows and Linux.
-Version 0.5.0 adds per-participant upload permissions and TLS-protected sessions.
+Version 0.6.0 adds shared-folder live updates, participant activity events, and
+desktop notifications on top of per-participant upload permissions and TLS sessions.
 Runtime file sharing works over the local network and does not need a cloud service,
 public certificate authority, or internet connection.
 
@@ -42,8 +43,16 @@ manual local address and port entry is supported.
 ## Participant permissions and file sharing
 
 Approved participants start with **READ_ONLY** permission. They can browse the
-host-selected directory, view file information, and download permitted files. The
-host can grant **READ_WRITE** to allow a participant to upload new files. This does
+host-selected directory, view file information, and download permitted files. File
+creation, modification, deletion, and directory changes are monitored on the host
+and sent over the authenticated WSS session. The participant browser refreshes the
+affected directory through the authenticated file API, so missed events are recovered
+from the host's current listing after reconnect. The host dashboard shows recent file
+and participant activity. ShareSpace requests native tray notifications when the
+desktop reports support and otherwise displays an in-app banner; native delivery is
+controlled by the operating system's notification settings.
+
+The host can grant **READ_WRITE** to allow a participant to upload new files. This does
 not allow overwriting, modifying, renaming, deleting, or creating directories.
 
 Uploads require both the participant's **READ_WRITE** permission and the host's
@@ -91,9 +100,12 @@ Run the automated suite with:
     python -m pytest -q
 
 Tests cover permissions, API authorization, upload cancellation and cleanup,
-certificate generation, fingerprint pinning, HTTPS/WSS loopback connections, and
-credential revocation. Loopback tests do not establish physical Windows/Linux
-connectivity, multicast reachability, firewall behavior, or hotspot support.
+certificate generation, fingerprint pinning, HTTPS/WSS loopback connections,
+filesystem event detection and filtering, event validation/backpressure, browser
+refresh hints, and notification fallback behavior. Filesystem and UI tests run on the
+current development OS; mocked notification checks do not verify actual desktop
+delivery. Loopback tests do not establish physical Windows/Linux connectivity,
+multicast reachability, firewall behavior, or hotspot support.
 
 See [docs/architecture.md](docs/architecture.md) for module boundaries and API
 authorization, and [docs/networking-tests.md](docs/networking-tests.md) for coverage,

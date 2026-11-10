@@ -175,23 +175,34 @@ def test_host_disconnect_closes_the_participant_socket_and_rejects_duplicate_aut
         )
         participant_token = poll.json()["participant_token"]
         authorization = {"Authorization": f"Bearer {credentials.host_token}"}
-        with client.websocket_connect(f"/api/v1/sessions/{session.session_id}/events") as first:
-            first.send_json({"type": "AUTHENTICATE", "token": participant_token})
-            authenticated = first.receive_json()
-            participant_id = authenticated["participant_id"]
-            assert first.receive_json()["type"] == "participant_connected"
+        with client.websocket_connect(f"/api/v1/sessions/{session.session_id}/events") as host_socket:
+            host_socket.send_json({"type": "AUTHENTICATE", "token": credentials.host_token})
+            assert host_socket.receive_json()["role"] == "HOST"
+            with client.websocket_connect(f"/api/v1/sessions/{session.session_id}/events") as first:
+                first.send_json({"type": "AUTHENTICATE", "token": participant_token})
+                authenticated = first.receive_json()
+                participant_id = authenticated["participant_id"]
+                joined = host_socket.receive_json()
+                assert joined["type"] == "participant_connected"
+                assert joined["event_type"] == "PARTICIPANT_JOINED"
+                assert first.receive_json()["event_type"] == "PARTICIPANT_JOINED"
 
-            with client.websocket_connect(f"/api/v1/sessions/{session.session_id}/events") as duplicate:
-                duplicate.send_json({"type": "AUTHENTICATE", "token": participant_token})
-                with pytest.raises(WebSocketDisconnect):
-                    duplicate.receive_json()
+                with client.websocket_connect(f"/api/v1/sessions/{session.session_id}/events") as duplicate:
+                    duplicate.send_json({"type": "AUTHENTICATE", "token": participant_token})
+                    with pytest.raises(WebSocketDisconnect):
+                        duplicate.receive_json()
 
-            disconnected = client.post(
-                f"/api/v1/host/participants/{participant_id}/disconnect",
-                headers=authorization,
-            )
-            assert disconnected.status_code == 200
-            assert first.receive_json()["type"] == "participant_disconnected"
+                disconnected = client.post(
+                    f"/api/v1/host/participants/{participant_id}/disconnect",
+                    headers=authorization,
+                )
+                assert disconnected.status_code == 200
+                terminal = first.receive_json()
+                assert terminal == {"type": "error", "code": "participant_disconnected"}
+                left = host_socket.receive_json()
+                assert left["type"] == "participant_disconnected"
+                assert left["event_type"] == "PARTICIPANT_LEFT"
+                assert left["data"]["participant_id"] == participant_id
 
     snapshot = manager.host_snapshot(credentials.host_token)
     peers = [item for item in snapshot[2] if item.role.value == "PARTICIPANT"]

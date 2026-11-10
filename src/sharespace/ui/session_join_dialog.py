@@ -27,6 +27,7 @@ from sharespace.networking.discovery import SessionDiscovery
 from sharespace.networking.file_client import FileClient
 from sharespace.networking.session_client import SessionClient
 from sharespace.ui.file_browser_dialog import FileBrowserDialog
+from sharespace.ui.notification_manager import NotificationManager
 from sharespace.ui.session_workers import SessionEventWorker, SessionWorker
 
 
@@ -68,6 +69,7 @@ class SessionJoinDialog(QDialog):
         heading = QLabel("Join a session")
         heading.setStyleSheet("font-size: 22px; font-weight: 700;")
         layout.addWidget(heading)
+        self._notifications = NotificationManager(self, layout)
         self._status = QLabel("Discovering sessions on the local network…")
         self._status.setWordWrap(True)
         self._status.setStyleSheet("color: #4357c5; font-weight: 600;")
@@ -493,6 +495,14 @@ class SessionJoinDialog(QDialog):
         self._thread_pool.start(worker)
 
     def _on_session_event(self, event: object) -> None:
+        if not isinstance(event, dict):
+            return
+        if self._file_browser is not None and event.get("type") in {
+            "file_created", "file_modified", "file_deleted", "shared_directory_changed",
+            "shared_directory_unavailable", "session_resync_required",
+            "participant_connected", "participant_disconnected",
+        }:
+            self._file_browser.handle_session_event(event)
         if event.get("type") == "authenticated":
             self._participant_id = event.get("participant_id")
             self._permission = PermissionLevel(
@@ -514,6 +524,49 @@ class SessionJoinDialog(QDialog):
                     uploads_enabled=bool(event.get("uploads_enabled")),
                     directory_name=event.get("directory_name"),
                 )
+        elif event.get("type") in {"participant_connected", "participant_disconnected"}:
+            data = event.get("data") if isinstance(event.get("data"), dict) else event
+            if (
+                event.get("type") == "participant_disconnected"
+                and isinstance(data, dict)
+                and data.get("participant_id") == self._participant_id
+            ):
+                self._participant_connected = False
+                self._stream_stop.set()
+                self._status.setText("The host disconnected this device from the session.")
+                self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+                if self._file_browser is not None:
+                    self._file_browser.set_session_unavailable(
+                        "The host disconnected this device from the session."
+                    )
+            elif isinstance(data, dict) and data.get("participant_id") != self._participant_id:
+                name = data.get("device_name")
+                if isinstance(name, str) and self._file_browser is None:
+                    self._notifications.notify(
+                        "Participant joined" if event.get("type") == "participant_connected" else "Participant left",
+                        name,
+                        event_id=event.get("event_id") if isinstance(event.get("event_id"), str) else None,
+                    )
+        elif event.get("type") in {
+            "file_created", "file_modified", "file_deleted", "shared_directory_changed",
+            "shared_directory_unavailable", "session_resync_required",
+        }:
+            if self._file_browser is None and event.get("type") in {
+                "file_created", "file_modified", "file_deleted",
+            }:
+                data = event.get("data") if isinstance(event.get("data"), dict) else event
+                if isinstance(data, dict):
+                    title = {
+                        "file_created": "New shared file",
+                        "file_modified": "Shared file updated",
+                        "file_deleted": "Shared file removed",
+                    }[event["type"]]
+                    filename = data.get("filename", "shared file")
+                    self._notifications.notify(
+                        title,
+                        str(filename),
+                        event_id=event.get("event_id") if isinstance(event.get("event_id"), str) else None,
+                    )
         elif event.get("type") == "session_ended":
             self._participant_connected = False
             self._poll_timer.stop()
@@ -534,10 +587,7 @@ class SessionJoinDialog(QDialog):
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
             if self._file_browser is not None:
                 self._file_browser.set_session_unavailable(detail)
-        elif (
-            event.get("type") == "participant_disconnected"
-            and event.get("participant_id") == self._participant_id
-        ):
+        elif event.get("type") == "error" and event.get("code") == "participant_disconnected":
             self._participant_connected = False
             self._stream_stop.set()
             self._status.setText("The host disconnected this device from the session.")
@@ -546,13 +596,14 @@ class SessionJoinDialog(QDialog):
                 self._file_browser.set_session_unavailable(
                     "The host disconnected this device from the session."
                 )
-
     def _on_stream_state(self, state: str) -> None:
         if state == "connected" and self._participant_token:
             self._participant_connected = True
             tls = self._client.tls_version if self._client else "TLS"
             self._status.setText(f"Connected securely to the ShareSpace session using {tls}.")
             self._status.setStyleSheet("color: #157347; font-weight: 600;")
+            if self._file_browser is not None:
+                self._file_browser.recover_authoritative()
         elif state == "disconnected" and self._participant_token:
             self._participant_connected = False
             self._status.setText("Session connection interrupted; trying to reconnect…")
@@ -610,4 +661,5 @@ class SessionJoinDialog(QDialog):
             self._thread_pool.start(SessionWorker(self._discovery.stop))
         if self._client is not None:
             self._client.close()
+        self._notifications.close()
         super().closeEvent(event)

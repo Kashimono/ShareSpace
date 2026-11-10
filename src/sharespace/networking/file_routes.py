@@ -23,7 +23,7 @@ from sharespace.networking.file_service import FileService, content_disposition,
 
 
 def create_file_router(
-    manager: SessionManager, file_service: FileService, *, event_broker=None
+    manager: SessionManager, file_service: FileService, *, event_broker=None, root_changed=None
 ) -> APIRouter:
     router = APIRouter()
 
@@ -198,12 +198,16 @@ def create_file_router(
     ):
         host(authorization)
         await file_service.select_root_guarded(data.path)
+        if root_changed is not None:
+            await root_changed(file_service.directories.root)
         return await publish_file_state()
 
     @router.post("/api/v1/host/files/stop", response_model=SharedDirectoryState)
     async def host_stop_sharing(authorization: str | None = Header(default=None)):
         host(authorization)
         await file_service.stop_sharing_guarded()
+        if root_changed is not None:
+            await root_changed(None)
         return await publish_file_state()
 
     @router.get("/api/v1/host/files/transfers", response_model=list[TransferView])

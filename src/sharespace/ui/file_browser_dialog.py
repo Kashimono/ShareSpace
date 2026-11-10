@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -27,7 +26,8 @@ from sharespace.core.models import (
     SharedDirectoryState,
     TransferStatus,
 )
-from sharespace.networking.file_client import FileClient, FileClientError
+from sharespace.networking.file_client import FileClient
+from sharespace.ui.notification_manager import NotificationManager
 from sharespace.ui.session_workers import SessionWorker
 
 
@@ -40,6 +40,7 @@ class FileBrowserDialog(QDialog):
         parent: QWidget | None = None,
         *,
         permission: PermissionLevel = PermissionLevel.READ_ONLY,
+        notifications: NotificationManager | None = None,
     ) -> None:
         super().__init__(parent)
         self.client = client
@@ -53,6 +54,8 @@ class FileBrowserDialog(QDialog):
         self._busy = False
         self._operation_id: str | None = None
         self._cancel_events: dict[str, threading.Event] = {}
+        self._live_refresh_pending = False
+        self._live_refresh_attempts = 0
 
         self.setWindowTitle("Shared files")
         self.setMinimumSize(640, 540)
@@ -60,10 +63,12 @@ class FileBrowserDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(10)
-
         heading = QLabel("Shared files")
         heading.setStyleSheet("font-size: 22px; font-weight: 700;")
         layout.addWidget(heading)
+        self._notifications = notifications or NotificationManager(
+            self, layout, native_owner=getattr(self.parent(), "_notifications", None)
+        )
         self._status = QLabel("Connecting to the host file service…")
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
@@ -111,6 +116,10 @@ class FileBrowserDialog(QDialog):
         self._transfer_timer.setInterval(500)
         self._transfer_timer.timeout.connect(self._refresh_transfers)
         self._transfer_timer.start()
+        self._live_refresh_timer = QTimer(self)
+        self._live_refresh_timer.setSingleShot(True)
+        self._live_refresh_timer.setInterval(180)
+        self._live_refresh_timer.timeout.connect(self._run_live_refresh)
         QTimer.singleShot(0, self._load_directory)
 
     def _load_directory(self) -> None:
@@ -172,6 +181,9 @@ class FileBrowserDialog(QDialog):
                 "The host has uploads disabled."
             )
         self._update_actions()
+        self._live_refresh_attempts = 0
+        if self._live_refresh_pending:
+            self._live_refresh_timer.start()
 
     def apply_permission(self, permission: PermissionLevel) -> None:
         """Apply a permission change received on the live session connection."""
@@ -213,6 +225,97 @@ class FileBrowserDialog(QDialog):
             self._update_status_for_permission()
         self._update_actions()
 
+    def handle_session_event(self, event: dict[str, object]) -> None:
+        """Treat authenticated events as hints and refresh via the file API."""
+        event_type = event.get("type")
+        data = event.get("data") if isinstance(event.get("data"), dict) else event
+        if not isinstance(data, dict):
+            data = event
+        event_id = event.get("event_id") if isinstance(event.get("event_id"), str) else None
+        if event_type in {"file_created", "file_modified", "file_deleted"}:
+            relative = data.get("relative_path")
+            parent = data.get("parent_path", "")
+            filename = data.get("filename", "shared file")
+            if not isinstance(relative, str) or not isinstance(parent, str):
+                return
+            if parent == self._path:
+                title = {
+                    "file_created": "New shared file",
+                    "file_modified": "Shared file updated",
+                    "file_deleted": "Shared file removed",
+                }[event_type]
+                self._notifications.notify(title, str(filename), event_id=event_id)
+                self._queue_live_refresh()
+            elif event_type == "file_deleted" and self._path.startswith(relative + "/"):
+                self._path = parent
+                self._queue_live_refresh()
+            return
+        if event_type == "shared_directory_unavailable":
+            self.apply_sharing_state(
+                available=False,
+                uploads_enabled=False,
+                directory_name=data.get("directory_name") if isinstance(data.get("directory_name"), str) else None,
+            )
+        elif event_type == "shared_directory_changed":
+            available = bool(data.get("available"))
+            directory_name = data.get("directory_name")
+            relative = data.get("relative_path")
+            if isinstance(relative, str):
+                change = data.get("change")
+                parent = relative.rpartition("/")[0]
+                if change == "deleted" and (self._path == relative or self._path.startswith(relative + "/")):
+                    self._path = parent
+                    self._queue_live_refresh()
+                elif self._path == parent:
+                    self._queue_live_refresh()
+                return
+            previous_name = self._state.directory_name if self._state else None
+            was_busy = self._busy
+            self._path = ""
+            self.apply_sharing_state(
+                available=available,
+                uploads_enabled=bool(self._state and self._state.uploads_enabled),
+                directory_name=directory_name if isinstance(directory_name, str) else None,
+            )
+            if available and (directory_name == previous_name or was_busy):
+                self._queue_live_refresh()
+        elif event_type == "file_sharing_state_changed":
+            self.apply_sharing_state(
+                available=bool(data.get("available")),
+                uploads_enabled=bool(data.get("uploads_enabled")),
+                directory_name=data.get("directory_name") if isinstance(data.get("directory_name"), str) else None,
+            )
+        elif event_type == "session_resync_required":
+            self.recover_authoritative()
+        elif event_type in {"participant_connected", "participant_disconnected"}:
+            participant_id = data.get("participant_id")
+            owner = self.parent()
+            if participant_id == getattr(owner, "_participant_id", None):
+                return
+            name = data.get("device_name")
+            if isinstance(name, str):
+                title = "Participant joined" if event_type == "participant_connected" else "Participant left"
+                self._notifications.notify(title, name, event_id=event_id)
+
+    def recover_authoritative(self) -> None:
+        """Reload the server-owned listing after a reconnect or event gap."""
+        self._queue_live_refresh()
+
+    def _queue_live_refresh(self) -> None:
+        if self._session_unavailable:
+            return
+        self._live_refresh_pending = True
+        self._live_refresh_attempts = 0
+        self._live_refresh_timer.start()
+
+    def _run_live_refresh(self) -> None:
+        if not self._live_refresh_pending or self._session_unavailable:
+            return
+        if self._busy:
+            return
+        self._live_refresh_pending = False
+        self._load_directory()
+
     def _update_status_for_permission(self) -> None:
         if not self._state:
             return
@@ -249,6 +352,17 @@ class FileBrowserDialog(QDialog):
         else:
             self._status.setText(f"File operation failed: {message}")
         self._update_actions()
+        if self._live_refresh_pending and not self._session_unavailable:
+            self._live_refresh_timer.start()
+        elif (
+            self._live_refresh_attempts == 0
+            and self._path
+            and any(marker in message.casefold() for marker in ("not found", "not a directory", "directory is unavailable"))
+        ):
+            self._live_refresh_attempts = 1
+            self._path = self._path.rpartition("/")[0]
+            self._live_refresh_pending = True
+            self._live_refresh_timer.start()
 
     def _go_up(self) -> None:
         if self._listing is None or self._listing.parent_path is None:
@@ -344,6 +458,8 @@ class FileBrowserDialog(QDialog):
         self._update_actions()
         if refresh_after and transfer.status is TransferStatus.COMPLETED:
             self._load_directory()
+        elif self._live_refresh_pending:
+            self._live_refresh_timer.start()
 
     def _refresh_transfers(self) -> None:
         current_id = self._transfers.currentItem().data(Qt.ItemDataRole.UserRole) if self._transfers.currentItem() else None
@@ -413,5 +529,7 @@ class FileBrowserDialog(QDialog):
             event.ignore()
             return
         self._transfer_timer.stop()
+        self._live_refresh_timer.stop()
+        self._notifications.close()
         self.client.close()
         super().closeEvent(event)

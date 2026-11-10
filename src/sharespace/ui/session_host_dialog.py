@@ -34,9 +34,10 @@ from sharespace.core.models import (
     TransferStatus,
 )
 from sharespace.networking.discovery import SessionAdvertiser
-from sharespace.networking.session_client import SessionClient, SessionClientError
+from sharespace.networking.session_client import SessionClient
 from sharespace.networking.session_server import SessionServer
 from sharespace.platform.platform_manager import PlatformManager
+from sharespace.ui.notification_manager import NotificationManager
 from sharespace.ui.session_workers import SessionEventWorker, SessionWorker
 
 
@@ -89,10 +90,15 @@ class SessionHostDialog(QDialog):
         heading = QLabel("Host session")
         heading.setStyleSheet("font-size: 22px; font-weight: 700;")
         layout.addWidget(heading)
+        self._notifications = NotificationManager(self, layout)
         self._status = QLabel("Starting the local session server…")
         self._status.setWordWrap(True)
         self._status.setStyleSheet("color: #4357c5; font-weight: 600;")
         layout.addWidget(self._status)
+        self._activity_label = QLabel("No recent session activity.")
+        self._activity_label.setWordWrap(True)
+        self._activity_label.setStyleSheet("color: #536177;")
+        layout.addWidget(self._activity_label)
 
         details = QFormLayout()
         self._name_label = QLabel(self._session_name or "ShareSpace session")
@@ -338,6 +344,8 @@ class SessionHostDialog(QDialog):
         self._thread_pool.start(worker)
 
     def _on_session_event(self, event: object) -> None:
+        if not isinstance(event, dict):
+            return
         if event.get("type") == "session_security_error":
             self._security_status.setText(
                 event.get("detail", "The host certificate could not be verified.")
@@ -345,6 +353,37 @@ class SessionHostDialog(QDialog):
             self._security_status.setStyleSheet("color: #b42318; font-weight: 600;")
             self._status.setText("Secure event connection failed. Review the certificate state.")
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+        event_type = event.get("type")
+        data = event.get("data") if isinstance(event.get("data"), dict) else event
+        if not isinstance(data, dict):
+            data = event
+        event_id = event.get("event_id") if isinstance(event.get("event_id"), str) else None
+        if event_type in {"file_created", "file_modified", "file_deleted"}:
+            filename = data.get("filename", "shared file")
+            label, title = {
+                "file_created": ("File added", "Shared file added"),
+                "file_modified": ("File updated", "Shared file updated"),
+                "file_deleted": ("File removed", "Shared file removed"),
+            }[event_type]
+            self._activity_label.setText(f"{label}: {filename}")
+            self._notifications.notify(title, str(filename), event_id=event_id)
+        elif event_type in {"participant_connected", "participant_disconnected"}:
+            name = data.get("device_name", "A participant")
+            joined = event_type == "participant_connected"
+            self._activity_label.setText(f"{name} {'joined' if joined else 'left'} the session.")
+            self._notifications.notify(
+                "Participant joined" if joined else "Participant left",
+                str(name),
+                event_id=event_id,
+            )
+        elif event_type == "shared_directory_unavailable":
+            self._activity_label.setText("The shared directory is unavailable.")
+            self._refresh_file_state()
+        elif event_type == "shared_directory_changed":
+            self._activity_label.setText("The shared directory changed.")
+            self._refresh_file_state()
+        elif event_type in {"file_sharing_state_changed", "session_resync_required"}:
+            self._refresh_file_state()
         self._refresh_snapshot()
 
     def _on_stream_state(self, state: str) -> None:
@@ -761,4 +800,5 @@ class SessionHostDialog(QDialog):
             return
         self._stream_stop.set()
         self._file_timer.stop()
+        self._notifications.close()
         super().closeEvent(event)

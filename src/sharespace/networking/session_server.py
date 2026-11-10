@@ -10,7 +10,6 @@ import ssl
 import threading
 import time
 from contextlib import asynccontextmanager
-from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
@@ -40,57 +39,13 @@ from sharespace.core.session_manager import (
 )
 from sharespace.core.transfer_manager import TransferCancelled, TransferNotFound
 from sharespace.networking.file_routes import create_file_router
+from sharespace.networking.file_event_coordinator import FileEventCoordinator
 from sharespace.networking.file_service import FileService
 from sharespace.networking.tls_security import SessionCertificateManager
+from sharespace.networking.websocket_events import EventBroker
 
 logger = logging.getLogger(__name__)
 API_PREFIX = "/api/v1"
-
-
-class EventBroker:
-    """Fan out small session-state events to currently connected WebSockets."""
-
-    def __init__(self, *, queue_size: int = 100) -> None:
-        self._queues: dict[asyncio.Queue[dict[str, Any]], str | None] = {}
-        self._active_participants: set[str] = set()
-        self._queue_size = queue_size
-
-    def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=self._queue_size)
-        self._queues[queue] = None
-        return queue
-
-    def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
-        self._queues.pop(queue, None)
-
-    def bind_participant(self, queue: asyncio.Queue[dict[str, Any]], participant_id: str) -> None:
-        if queue in self._queues:
-            self._queues[queue] = participant_id
-
-    def claim_participant(self, participant_id: str) -> bool:
-        """Allow only one live WebSocket for a participant token at a time."""
-        if participant_id in self._active_participants:
-            return False
-        self._active_participants.add(participant_id)
-        return True
-
-    def release_participant(self, participant_id: str) -> None:
-        self._active_participants.discard(participant_id)
-
-    async def publish(
-        self,
-        event: dict[str, Any],
-        *,
-        target_participant_id: str | None = None,
-    ) -> None:
-        for queue, participant_id in tuple(self._queues.items()):
-            if target_participant_id is not None and participant_id != target_participant_id:
-                continue
-            if queue.full():
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    queue.get_nowait()
-            with contextlib.suppress(asyncio.QueueFull):
-                queue.put_nowait(event)
 
 
 def create_session_app(
@@ -103,14 +58,24 @@ def create_session_app(
     """Build an isolated app instance for one host session or an API test."""
     broker = event_broker or EventBroker()
     files = file_service or FileService()
+    file_events = FileEventCoordinator(files, broker)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        await file_events.start()
+
         async def monitor() -> None:
             while True:
                 await asyncio.sleep(monitor_interval_seconds)
+                before = {peer.participant_id for peer in manager.connected_participants()}
                 for change in manager.expire_inactive():
-                    await broker.publish({"type": change})
+                    if change != "participant_disconnected":
+                        await broker.publish({"type": change})
+                after = {peer.participant_id for peer in manager.connected_participants()}
+                for participant_id in before - after:
+                    peer = manager.participant_view(participant_id)
+                    if peer is not None:
+                        await broker.publish(_participant_activity_event("participant_disconnected", peer, manager))
                 await files.cancel_disconnected_participants(manager.connected_participant_ids())
 
         monitor_task = asyncio.create_task(monitor(), name="sharespace-heartbeat-monitor")
@@ -120,10 +85,11 @@ def create_session_app(
             monitor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await monitor_task
+            await file_events.close()
 
     app = FastAPI(
         title="ShareSpace Local Session API",
-        version="0.5.0",
+        version="0.6.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -132,6 +98,7 @@ def create_session_app(
     app.state.session_manager = manager
     app.state.event_broker = broker
     app.state.file_service = files
+    app.state.file_event_coordinator = file_events
 
     @app.exception_handler(FileAccessError)
     async def file_error_handler(_request: Request, error: FileAccessError) -> JSONResponse:
@@ -259,7 +226,7 @@ def create_session_app(
             participant = manager.disconnect_participant(participant_id, host_token)
             files.transfers.cancel_active(participant_id=participant_id)
         logger.info("Participant disconnected by host: participant_id=%s", participant_id)
-        await broker.publish({"type": "participant_disconnected", "participant_id": participant_id})
+        await broker.publish(_participant_activity_event("participant_disconnected", participant, manager))
         return {"status": participant.status.value, "participant_id": participant_id}
 
     @app.post(f"{API_PREFIX}/host/participants/{{participant_id}}/permissions")
@@ -312,6 +279,7 @@ def create_session_app(
             session = manager.end_session(host_token)
             files.transfers.cancel_active()
             files.set_uploads_enabled(False)
+        await file_events.stop()
         await broker.publish({"type": "session_ended", "session_id": session.session_id})
         return {"status": "ended", "session_id": session.session_id}
 
@@ -342,7 +310,7 @@ def create_session_app(
                 role = "host"
                 permission = None
             else:
-                participant = manager.authenticate_participant(token)
+                participant, transitioned = manager.authenticate_participant_with_transition(token)
                 participant_id = participant.participant_id
                 permission = participant.permission.value if participant.permission else None
                 if not broker.claim_participant(participant_id):
@@ -351,6 +319,7 @@ def create_session_app(
                 participant_claimed = True
                 broker.bind_participant(queue, participant_id)
                 role = "participant"
+            directory_state = files.state()
             await websocket.send_json(
                 {
                     "type": "authenticated",
@@ -358,10 +327,17 @@ def create_session_app(
                     "participant_id": participant_id,
                     "permission": permission,
                     "heartbeat_interval_seconds": 5,
+                    "shared_directory": {
+                        "available": directory_state.available,
+                        "uploads_enabled": directory_state.uploads_enabled,
+                        "directory_name": directory_state.directory_name,
+                    },
                 }
             )
-            if participant_id:
-                await broker.publish({"type": "participant_connected", "participant_id": participant_id})
+            if participant_id and transitioned:
+                await broker.publish(
+                    _participant_activity_event("participant_connected", participant, manager),
+                )
             last_heartbeat = time.monotonic()
             while True:
                 try:
@@ -380,17 +356,19 @@ def create_session_app(
                     return
                 while not queue.empty():
                     event = queue.get_nowait()
-                    await websocket.send_json(event)
                     if event.get("type") == "session_ended":
+                        # Session termination is the final control event for all
+                        # peers, including credentials revoked by that operation.
+                        await websocket.send_json(event)
                         await websocket.close(code=4000, reason="Host ended the session.")
                         return
-                    if (
-                        participant_id
-                        and event.get("type") == "participant_disconnected"
-                        and event.get("participant_id") == participant_id
-                    ):
-                        await websocket.close(code=4003, reason="Host disconnected this participant.")
+                    if participant_id and not manager.participant_is_connected(participant_id):
+                        # A final control message contains no event payload. Never
+                        # deliver queued session data after the credential is revoked.
+                        await websocket.send_json({"type": "error", "code": "participant_disconnected"})
+                        await websocket.close(code=4003, reason="Participant access was revoked.")
                         return
+                    await websocket.send_json(event)
         except SessionError as error:
             logger.warning("Session WebSocket authorization rejected: %s", error.code)
             with contextlib.suppress(Exception):
@@ -411,10 +389,27 @@ def create_session_app(
                 broker.release_participant(participant_id)
                 if participant is not None:
                     logger.info("Participant WebSocket disconnected: participant_id=%s", participant_id)
-                    await broker.publish({"type": "participant_disconnected", "participant_id": participant_id})
+                    await broker.publish(_participant_activity_event("participant_disconnected", participant, manager))
 
-    app.include_router(create_file_router(manager, files, event_broker=broker))
+    app.include_router(create_file_router(
+        manager,
+        files,
+        event_broker=broker,
+        root_changed=file_events.set_root,
+    ))
     return app
+
+
+def _participant_activity_event(event_type: str, participant, manager: SessionManager) -> dict[str, object]:
+    """Build a non-secret host/participant transition event."""
+    session = manager.get_public_session()
+    return {
+        "type": event_type,
+        "participant_id": participant.participant_id,
+        "device_name": participant.device_name,
+        "operating_system": participant.operating_system,
+        "participant_count": session.participant_count,
+    }
 
 
 class SessionServer:

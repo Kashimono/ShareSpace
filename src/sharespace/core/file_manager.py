@@ -35,6 +35,22 @@ class SharedDirectoryManager:
         with self._lock:
             return self._root
 
+    def root_available(self) -> bool:
+        """Return whether the selected root still names the same real directory."""
+        root = self.root
+        if root is None:
+            return False
+        try:
+            info = root.lstat()
+            if self._is_link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
+                return False
+            resolved = root.resolve(strict=True)
+            return os.path.normcase(os.path.normpath(str(resolved))) == os.path.normcase(
+                os.path.normpath(str(root))
+            )
+        except (OSError, RuntimeError, ValueError):
+            return False
+
     def select_root(self, path: str | os.PathLike[str]) -> SharedDirectoryState:
         candidate = Path(path).expanduser()
         try:
@@ -62,7 +78,7 @@ class SharedDirectoryManager:
             root = self._root
         return SharedDirectoryState(
             shared=root is not None,
-            available=root is not None and root.is_dir(),
+            available=self.root_available(),
             directory_name=root.name if root is not None else None,
             uploads_enabled=uploads_enabled and root is not None,
         )
@@ -202,7 +218,7 @@ class SharedDirectoryManager:
     def _require_root(self) -> Path:
         with self._lock:
             root = self._root
-        if root is None or not root.is_dir():
+        if root is None or not self.root_available():
             raise FileAccessError("The host is not sharing a directory.", "sharing_unavailable", 404)
         return root
 

@@ -20,6 +20,7 @@ from sharespace.networking.tls_security import (
     TLSVerificationError,
     format_fingerprint,
 )
+from sharespace.networking.websocket_events import RecentEventIds, validate_wire_event
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,7 @@ class SessionClient:
         """Reconnect and consume events; participant clients send heartbeats."""
         uri = f"wss://{self.host}:{self.port}{API_PREFIX}/sessions/{session_id}/events"
         retry_delay = 1.0
+        recent_ids = RecentEventIds()
         while not stop_event.is_set():
             try:
                 await self.security.verify_peer()
@@ -181,6 +183,14 @@ class SessionClient:
                             continue
                         data = json.loads(raw)
                         if isinstance(data, dict):
+                            if "event_id" in data:
+                                try:
+                                    event = validate_wire_event(data)
+                                except (TypeError, ValueError):
+                                    logger.warning("Ignored an invalid session event envelope.")
+                                    continue
+                                if not recent_ids.add(event.event_id):
+                                    continue
                             on_event(data)
                             if data.get("type") == "session_ended":
                                 return

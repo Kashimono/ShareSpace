@@ -329,18 +329,28 @@ class SessionManager:
             return request.view()
 
     def authenticate_participant(self, participant_token: str, *, now: datetime | None = None) -> ParticipantView:
+        participant, _transitioned = self.authenticate_participant_with_transition(
+            participant_token, now=now
+        )
+        return participant
+
+    def authenticate_participant_with_transition(
+        self, participant_token: str, *, now: datetime | None = None
+    ) -> tuple[ParticipantView, bool]:
+        """Authenticate a WSS peer and report whether it became connected now."""
         current = now or self._now()
         with self._lock:
             self._active_session()
             participant = self._participant_for_token(participant_token)
             if participant.status not in {ParticipantStatus.PENDING, ParticipantStatus.CONNECTED, ParticipantStatus.DISCONNECTED}:
                 raise InvalidCredential("Participant credential is no longer active.")
+            transitioned = participant.status is not ParticipantStatus.CONNECTED
             participant.status = ParticipantStatus.CONNECTED
             participant.last_heartbeat = current
             if participant.joined_at is None:
                 participant.joined_at = current
             self._refresh_count()
-            return participant.view()
+            return participant.view(), transitioned
 
     def authenticate_http_participant(self, participant_token: str) -> ParticipantView:
         """Authenticate HTTP file requests without promoting a disconnected peer."""
@@ -434,12 +444,42 @@ class SessionManager:
         """Mark a WebSocket departure without revoking a temporary reconnect."""
         with self._lock:
             participant = self._participants.get(participant_id)
-            if participant is None or participant.role is ParticipantRole.HOST:
+            if (
+                participant is None
+                or participant.role is ParticipantRole.HOST
+                or participant.status is not ParticipantStatus.CONNECTED
+            ):
                 return None
-            if participant.status is ParticipantStatus.CONNECTED:
-                participant.status = ParticipantStatus.DISCONNECTED
-                self._refresh_count()
+            participant.status = ParticipantStatus.DISCONNECTED
+            self._refresh_count()
             return participant.view()
+
+    def connected_participants(self) -> list[ParticipantView]:
+        """Return a snapshot of connected participant records for activity events."""
+        with self._lock:
+            return [
+                participant.view()
+                for participant in self._participants.values()
+                if participant.role is ParticipantRole.PARTICIPANT
+                and participant.status is ParticipantStatus.CONNECTED
+            ]
+
+    def participant_is_connected(self, participant_id: str) -> bool:
+        """Check an authenticated WSS identity before sending another event."""
+        with self._lock:
+            participant = self._participants.get(participant_id)
+            return (
+                participant is not None
+                and participant.role is ParticipantRole.PARTICIPANT
+                and participant.status is ParticipantStatus.CONNECTED
+                and participant.token_digest is not None
+            )
+
+    def participant_view(self, participant_id: str) -> ParticipantView | None:
+        """Return one participant's safe view for transition notifications."""
+        with self._lock:
+            participant = self._participants.get(participant_id)
+            return participant.view() if participant is not None else None
 
     def expire_inactive(self, *, now: datetime | None = None) -> list[str]:
         """Expire join requests and stale connected peers; return event names."""

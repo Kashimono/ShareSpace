@@ -32,7 +32,8 @@ class FileService:
     @property
     def uploads_enabled(self) -> bool:
         with self._lock:
-            return self._uploads_enabled and self.directories.root is not None
+            enabled = self._uploads_enabled
+        return enabled and self.directories.root_available()
 
     def state(self):
         return self.directories.state(self.uploads_enabled)

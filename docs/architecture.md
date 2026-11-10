@@ -1,10 +1,10 @@
 # ShareSpace architecture
 
-Version 0.5.0 adds participant upload permissions and encrypted local sessions to the
-Version 0.4 file-sharing engine. It keeps the existing FastAPI/Uvicorn server,
-WebSocket event stream, Qt UI, and separate Windows and Linux hotspot adapters.
-Sessions and certificates work offline; there is no public certificate authority or
-cloud dependency.
+Version 0.6.0 adds live shared-folder updates, participant activity events, and
+desktop notification fallbacks to the Version 0.5 permissions and security layer.
+It reuses the existing FastAPI/Uvicorn server, authenticated WSS endpoint, Qt UI, and
+separate Windows and Linux hotspot adapters. Monitoring and session traffic work
+offline; there is no public certificate authority or cloud dependency.
 
 ## Module boundaries
 
@@ -18,7 +18,16 @@ cloud dependency.
   connection, and permission; the client never supplies these values.
 - `sharespace.core.file_manager.SharedDirectoryManager` owns the host-selected root,
   relative-path validation, hidden-item filtering, symlink/reparse rejection, and
-  confinement checks.
+  confinement checks. Its `root_available()` check also detects a removed or
+  replaced selected root.
+- `sharespace.core.file_monitor.FileMonitor` owns one watchdog observer and one
+  bounded event worker. It schedules non-recursive watches for directories that the
+  manager lists as permitted, then derives public file changes from safe directory
+  snapshots. It never reads contents or publishes absolute paths. A short quiet
+  interval (250 ms by default) coalesces bursts. Ordinary file changes rescan only
+  affected parent directories; directory topology changes and queue overflow use a
+  full safe scan. Inaccessible subtrees retain their previous snapshot until access
+  returns. Queue overflow produces a resync hint.
 - `sharespace.core.transfer_manager.TransferManager` tracks transfer state, byte
   counts, cancellation, and bounded in-memory history. It stores no file content.
 - `sharespace.core.device_manager.DeviceManager` identifies the device and available
@@ -54,6 +63,15 @@ cloud dependency.
   authorization gate serializes permission changes, host upload toggles, participant
   disconnects, root changes, chunk writes, and final file publication. It cancels
   active uploads when access is revoked and removes incomplete temporary files.
+- `sharespace.networking.websocket_events` validates one event envelope and the
+  payload for each event type. `EventBroker` reuses authenticated WSS clients,
+  filters targeted permission events, isolates per-client queues, and replaces an
+  overfull queue with `SESSION_RESYNC_REQUIRED`. Event history is not persisted.
+- `sharespace.networking.file_event_coordinator.FileEventCoordinator` owns the
+  session monitor, restarts it on authorized root changes, marshals monitor-thread
+  callbacks onto asyncio, and stops it on sharing/session shutdown. The monitor is
+  the only file-event source: an upload is reported after FileService's atomic
+  publication is visible in a manager listing, with no synthetic upload event.
 - `sharespace.networking.file_client.FileClient` verifies the pinned certificate for
   file operations, streams without loading whole files into memory, and creates local
   download files without overwriting an existing destination.
@@ -64,19 +82,31 @@ cloud dependency.
 - `SessionHostDialog` shows the security status, negotiated TLS version, session
   fingerprint, requests, participant roles/status/permission, global upload setting,
   and transfer state. The host can copy the fingerprint, grant/revoke `READ_WRITE`,
-  disconnect participants, and stop sharing.
+  disconnect participants, and stop sharing. Its activity line and notifications
+  update on file and participant events.
 - `SessionJoinDialog` shows the expected fingerprint. It requires the participant to
   affirm an independent trusted-channel comparison before verification and before the
   joining code is sent. TLS errors and replacement fingerprints are surfaced to the
   participant.
 - `FileBrowserDialog` keeps browsing and downloading available to `READ_ONLY`
   participants. Upload controls require both `READ_WRITE` and the globally enabled
-  upload state. It updates when a targeted permission event arrives.
+  upload state. It refreshes only affected paths through the authenticated API when
+  file or directory events arrive and refetches the current listing after reconnect
+  or a resync hint.
+- `sharespace.ui.notification_manager.NotificationManager` requests a Qt system-tray
+  notification when available and otherwise shows a short in-app banner. Native
+  delivery depends on the platform and user notification settings; automated checks
+  mock this boundary.
 - `sharespace.ui.session_workers` runs blocking setup and network work away from the
-  Qt presentation thread.
+  Qt presentation thread. The filesystem observer and its snapshot worker also run
+  outside the Qt presentation thread; callbacks enter asyncio with
+  `run_coroutine_threadsafe`, and UI updates arrive through Qt signals.
 
 The Windows and Linux hotspot implementations remain in their platform-specific
 modules. TLS, session logic, file services, and permissions are shared.
+Watchdog selects its platform observer behind the shared `FileMonitor` API. Automated
+filesystem integration was run on Windows in this workspace; Linux watcher behavior
+has not been run here.
 
 ## Session, permission, and trust flow
 
@@ -93,7 +123,11 @@ sequenceDiagram
     Peer->>Server: HTTPS GET session and submit join request
     Host->>Server: Approve request using host bearer token
     Peer->>Server: Poll approval, authenticate WSS
-    Server-->>Peer: Authenticated event with READ_ONLY permission
+    Server-->>Peer: Authenticated response, permission and current directory state
+    Server-->>Host: PARTICIPANT_JOINED after a connected-state transition
+    Server-->>Peer: Validated file/directory events after safe monitor scans
+    Peer->>Server: Refresh affected listing over authenticated HTTPS
+    Peer->>Server: Refetch current listing after reconnect/resync
     Host->>Server: Grant READ_WRITE over HTTPS
     Server-->>Peer: Targeted permission change event over WSS
     Peer->>Server: Upload over HTTPS only if READ_WRITE and global switch enabled
@@ -173,10 +207,25 @@ session certificate.
 
 The WSS endpoint is `/api/v1/sessions/{session_id}/events`. The first message
 authenticates with a bearer token after TLS is established. Participants send a
-heartbeat every five seconds. Permission changes are sent only to the affected
-participant. File-sharing state events include only availability, global upload
-status, and the shared directory display name. Events never include joining codes,
-bearer tokens, private keys, or filesystem paths.
+heartbeat every five seconds. Each event has `event_id`, `event_type`, a timezone-aware
+ISO-8601 `timestamp`, and validated `data`; a legacy `type` and flat payload fields
+remain for v0.5 UI compatibility. File events contain relative path, filename,
+parent directory, and optional size/modified time only. Participant activity events
+contain participant ID, device name, operating system, and count. Permission changes
+are sent only to the affected participant. File-sharing state events contain
+availability, global upload status, and the shared-directory display name. Events
+never include joining codes, bearer tokens, private keys, file contents, or absolute
+host filesystem paths.
+
+The first and each recovered listing comes from the authenticated HTTP file API; WSS
+events are update hints and do not authorize file access. The host's current directory
+contents remain authoritative. WebSocket queues are bounded and event IDs are
+deduplicated by clients, but there is no persistent event history. After reconnect or
+queue overflow, clients retrieve the current listing instead of replaying missed
+notifications. The filesystem worker uses manager path validation and excludes
+hidden entries, symbolic links, reparse points, and known temporary names. Uploads
+remain hidden under `.sharespace-*.part` while in progress and are observed only once
+the existing no-overwrite atomic publication completes.
 
 ## Security boundaries and limitations
 
@@ -202,7 +251,13 @@ bearer tokens, private keys, or filesystem paths.
   multicast settings, or client isolation. Hotspot behavior remains limited by the
   existing platform adapters. Physical Windows/Linux network behavior requires
   separate hardware testing.
+- The watcher uses a 250 ms quiet interval and a 4,096-entry pending-event queue.
+  No benchmark was run. A large directory move or overflow causes a recursive safe
+  metadata scan; ordinary file changes inspect only their affected parent folders.
+  Actual OS tray notification delivery and Linux filesystem observer behavior need
+  platform testing.
 
 The implementation preserves the Version 0.4 file size limit and file operations.
-File deletion, rename, participant-created directories, synchronization, persistent
-history, cloud services, and end-to-end encryption are outside Version 0.5.
+Participants still cannot delete or rename files or create directories. File
+synchronization, automatic transfer, persistent event/notification history, cloud
+services, and end-to-end encryption are outside Version 0.6.
