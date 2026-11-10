@@ -125,11 +125,29 @@ class TransferManager:
             self._prune()
             return record.view()
 
-    def cancel_active(self, *, direction: TransferDirection | None = None) -> None:
+    def cancel_active(
+        self,
+        *,
+        direction: TransferDirection | None = None,
+        participant_id: str | None = None,
+    ) -> None:
         with self._lock:
             for record in self._transfers.values():
                 if record.status in {TransferStatus.QUEUED, TransferStatus.IN_PROGRESS} and (
                     direction is None or record.direction is direction
+                ) and (
+                    participant_id is None or record.participant_id == participant_id
+                ):
+                    record.cancel_event.set()
+                    record.status = TransferStatus.CANCELLED
+                    record.completed_at = datetime.now(timezone.utc)
+
+    def cancel_disconnected_participants(self, connected_participant_ids: set[str]) -> None:
+        with self._lock:
+            for record in self._transfers.values():
+                if (
+                    record.status in {TransferStatus.QUEUED, TransferStatus.IN_PROGRESS}
+                    and record.participant_id not in connected_participant_ids
                 ):
                     record.cancel_event.set()
                     record.status = TransferStatus.CANCELLED

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import tempfile
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -15,8 +17,14 @@ from sharespace.core.file_manager import MAX_FILE_SIZE_BYTES
 from sharespace.core.models import DirectoryListing, SharedDirectoryState, TransferDirection, TransferView
 from sharespace.core.transfer_manager import TransferCancelled, TransferManager
 from sharespace.networking.session_server import API_PREFIX
+from sharespace.networking.tls_security import (
+    TLSConnectionSecurity,
+    TLSVerificationError,
+    format_fingerprint,
+)
 
 ProgressCallback = Callable[[TransferView], None]
+logger = logging.getLogger(__name__)
 
 
 class FileClientError(RuntimeError):
@@ -26,11 +34,41 @@ class FileClientError(RuntimeError):
 class FileClient:
     """Perform authenticated file API calls without Qt dependencies."""
 
-    def __init__(self, host: str, port: int, token: str, *, timeout_seconds: float = 15.0) -> None:
-        self.base_url = f"http://{host}:{port}{API_PREFIX}"
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        token: str,
+        *,
+        security: TLSConnectionSecurity | None = None,
+        certificate_fingerprint: str | None = None,
+        timeout_seconds: float = 15.0,
+    ) -> None:
+        if security is None:
+            if certificate_fingerprint is None:
+                raise FileClientError("A verified session certificate fingerprint is required.")
+            security = TLSConnectionSecurity(
+                host, port, certificate_fingerprint, timeout_seconds=timeout_seconds
+            )
+        if security.host != host or security.port != port:
+            raise FileClientError("TLS trust configuration does not match the host address.")
+        self.security = security
+        self.base_url = f"https://{host}:{port}{API_PREFIX}"
         self.token = token
         self.timeout_seconds = timeout_seconds
         self.transfers = TransferManager()
+        self._http_client: httpx.Client | None = None
+        self._http_client_lock = threading.Lock()
+
+    @property
+    def tls_version(self) -> str | None:
+        return self.security.tls_version
+
+    def close(self) -> None:
+        with self._http_client_lock:
+            client, self._http_client = self._http_client, None
+        if client is not None:
+            client.close()
 
     async def settings(self) -> SharedDirectoryState:
         return SharedDirectoryState.model_validate(await self._json("GET", "/files/settings"))
@@ -74,8 +112,11 @@ class FileClient:
         temporary: Path | None = None
         descriptor: int | None = None
         try:
+            await self.security.verify_peer()
             timeout = httpx.Timeout(self.timeout_seconds, read=None)
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout, verify=self.security.ssl_context, trust_env=False
+            ) as client:
                 async with client.stream(
                     "GET",
                     f"{self.base_url}/files/download",
@@ -128,6 +169,17 @@ class FileClient:
                 else:
                     result = self.transfers.fail(identifier, _safe_error(error))
                 _notify(on_progress, result)
+            if isinstance(error, TLSVerificationError):
+                logger.warning("File download TLS certificate validation failed.")
+                raise FileClientError(str(error)) from error
+            if isinstance(error, httpx.HTTPError):
+                replacement = await self.security.inspect_changed_fingerprint()
+                if replacement is not None:
+                    logger.warning("File download certificate changed during the session.")
+                    raise FileClientError(
+                        "The host certificate changed. Presented fingerprint: "
+                        f"{format_fingerprint(replacement)}"
+                    ) from error
             if isinstance(error, FileClientError | TransferCancelled | asyncio.CancelledError):
                 raise
             raise FileClientError("Could not download the file from the host.") from error
@@ -180,8 +232,11 @@ class FileClient:
                     raise FileClientError("The selected file changed during upload.")
 
         try:
+            await self.security.verify_peer()
             timeout = httpx.Timeout(self.timeout_seconds, read=None, write=None)
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout, verify=self.security.ssl_context, trust_env=False
+            ) as client:
                 response = await client.post(
                     f"{self.base_url}/files/upload",
                     params={"path": relative_directory},
@@ -210,23 +265,58 @@ class FileClient:
                 else:
                     result = self.transfers.fail(identifier, _safe_error(error))
                 _notify(on_progress, result)
+            if isinstance(error, TLSVerificationError):
+                logger.warning("File upload TLS certificate validation failed.")
+                raise FileClientError(str(error)) from error
+            if isinstance(error, httpx.HTTPError):
+                replacement = await self.security.inspect_changed_fingerprint()
+                if replacement is not None:
+                    logger.warning("File upload certificate changed during the session.")
+                    raise FileClientError(
+                        "The host certificate changed. Presented fingerprint: "
+                        f"{format_fingerprint(replacement)}"
+                    ) from error
             if isinstance(error, FileClientError | TransferCancelled | asyncio.CancelledError):
                 raise
             raise FileClientError("Could not upload the file to the host.") from error
 
     async def _json(self, method: str, path: str, *, params: dict[str, str] | None = None):
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.request(
-                    method, f"{self.base_url}{path}", params=params, headers=self._headers()
-                )
+            await self.security.verify_peer()
+            response = await asyncio.to_thread(
+                self._get_http_client().request,
+                method,
+                f"{self.base_url}{path}",
+                params=params,
+                headers=self._headers(),
+            )
         except httpx.HTTPError as error:
+            replacement = await self.security.inspect_changed_fingerprint()
+            if replacement is not None:
+                logger.warning("File API certificate changed during the session.")
+                raise FileClientError(
+                    "The host certificate changed. Presented fingerprint: "
+                    f"{format_fingerprint(replacement)}"
+                ) from error
             raise FileClientError("Could not reach the ShareSpace session host.") from error
+        except TLSVerificationError as error:
+            logger.warning("File API TLS certificate validation failed.")
+            raise FileClientError(str(error)) from error
         self._raise_for_status(response)
         try:
             return response.json()
         except ValueError as error:
             raise FileClientError("The host returned an invalid response.") from error
+
+    def _get_http_client(self) -> httpx.Client:
+        with self._http_client_lock:
+            if self._http_client is None:
+                self._http_client = httpx.Client(
+                    timeout=self.timeout_seconds,
+                    verify=self.security.ssl_context,
+                    trust_env=False,
+                )
+            return self._http_client
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {self.token}"}

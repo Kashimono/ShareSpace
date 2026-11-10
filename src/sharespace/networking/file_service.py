@@ -7,6 +7,7 @@ import mimetypes
 import os
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import quote
 
@@ -24,6 +25,7 @@ class FileService:
         self.directories = SharedDirectoryManager()
         self.transfers = TransferManager()
         self._lock = threading.RLock()
+        self.authorization_gate = asyncio.Lock()
         self._uploads_enabled = False
         self._temporary_files: set[Path] = set()
 
@@ -41,10 +43,18 @@ class FileService:
         self.set_uploads_enabled(False)
         return result
 
+    async def select_root_guarded(self, path: str | os.PathLike[str]):
+        async with self.authorization_gate:
+            return self.select_root(path)
+
     def stop_sharing(self):
         self.transfers.cancel_active()
         self.set_uploads_enabled(False)
         return self.directories.stop_sharing()
+
+    async def stop_sharing_guarded(self):
+        async with self.authorization_gate:
+            return self.stop_sharing()
 
     def set_uploads_enabled(self, enabled: bool):
         with self._lock:
@@ -53,6 +63,33 @@ class FileService:
         if not result:
             self.transfers.cancel_active(direction=TransferDirection.UPLOAD)
         return result
+
+    async def set_uploads_enabled_guarded(self, enabled: bool):
+        async with self.authorization_gate:
+            return self.set_uploads_enabled(enabled)
+
+    async def cancel_participant_uploads(self, participant_id: str) -> None:
+        async with self.authorization_gate:
+            self.transfers.cancel_active(
+                direction=TransferDirection.UPLOAD,
+                participant_id=participant_id,
+            )
+
+    async def disconnect_participant(self, participant_id: str) -> None:
+        async with self.authorization_gate:
+            self.transfers.cancel_active(participant_id=participant_id)
+
+    async def cancel_disconnected_participants(self, connected_ids: set[str]) -> None:
+        async with self.authorization_gate:
+            self.transfers.cancel_disconnected_participants(connected_ids)
+
+    async def cancel_all_transfers(self) -> None:
+        async with self.authorization_gate:
+            self.transfers.cancel_active()
+
+    async def cancel_transfer(self, transfer_id: str, *, participant_id: str | None = None):
+        async with self.authorization_gate:
+            return self.transfers.cancel(transfer_id, participant_id=participant_id)
 
     def browse(self, relative_path: str = ""):
         return self.directories.listing(relative_path)
@@ -95,9 +132,11 @@ class FileService:
 
     async def receive_upload(self, *, relative_directory: str, filename: str,
                              expected_size: int, transfer_id: str,
-                             participant_id: str, body) -> dict[str, object]:
+                             participant_id: str, body,
+                             authorize_upload: Callable[[], object]) -> dict[str, object]:
         if not self.uploads_enabled:
             raise FileAccessError("The host has not enabled uploads.", "uploads_disabled", 403)
+        authorize_upload()
         if expected_size < 0 or expected_size > MAX_FILE_SIZE_BYTES:
             raise FileAccessError("Uploads are limited to 20 MB per file.", "file_too_large", 413)
         target, relative_target = self.directories.validate_upload_target(relative_directory, filename)
@@ -109,14 +148,15 @@ class FileService:
         descriptor: int | None = None
         written = 0
         try:
-            with self._lock:
-                if not self._uploads_enabled:
-                    raise FileAccessError("The host has disabled uploads.", "uploads_disabled", 403)
-            self.directories.ensure_path_is_in_root(target.parent)
-            descriptor, temporary_name = tempfile.mkstemp(prefix=".sharespace-", suffix=".part", dir=target.parent)
-            temporary_path = Path(temporary_name)
-            with self._lock:
-                self._temporary_files.add(temporary_path)
+            async with self.authorization_gate:
+                self._require_upload_authorization(authorize_upload, transfer_id)
+                self.directories.ensure_path_is_in_root(target.parent)
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=".sharespace-", suffix=".part", dir=target.parent
+                )
+                temporary_path = Path(temporary_name)
+                with self._lock:
+                    self._temporary_files.add(temporary_path)
             while True:
                 if self.transfers.cancellation_event(transfer_id).is_set():
                     raise TransferCancelled("Transfer was cancelled.")
@@ -129,22 +169,26 @@ class FileService:
                 written += len(chunk)
                 if written > MAX_FILE_SIZE_BYTES or written > expected_size:
                     raise FileAccessError("Upload exceeded its declared size.", "size_mismatch", 413)
-                await asyncio.to_thread(_write_all, descriptor, chunk)
-                self.transfers.advance(transfer_id, len(chunk))
+                async with self.authorization_gate:
+                    self._require_upload_authorization(authorize_upload, transfer_id)
+                    await asyncio.to_thread(_write_all, descriptor, chunk)
+                    self.transfers.advance(transfer_id, len(chunk))
             if written != expected_size:
                 raise FileAccessError("Upload ended before its declared size.", "size_mismatch", 400)
             await asyncio.to_thread(os.fsync, descriptor)
             await asyncio.to_thread(os.close, descriptor)
             descriptor = None
-            self.directories.ensure_path_is_in_root(target.parent)
-            try:
-                await asyncio.to_thread(_finalize_without_overwrite, temporary_path, target)
-            except FileExistsError as error:
-                raise FileAccessError("A file with this name already exists.", "destination_exists", 409) from error
-            except OSError as error:
-                raise FileAccessError("The destination cannot safely accept new files.", "destination_unavailable", 409) from error
-            temporary_path = None
-            self.transfers.complete(transfer_id)
+            async with self.authorization_gate:
+                self._require_upload_authorization(authorize_upload, transfer_id)
+                self.directories.ensure_path_is_in_root(target.parent)
+                try:
+                    await asyncio.to_thread(_finalize_without_overwrite, temporary_path, target)
+                except FileExistsError as error:
+                    raise FileAccessError("A file with this name already exists.", "destination_exists", 409) from error
+                except OSError as error:
+                    raise FileAccessError("The destination cannot safely accept new files.", "destination_unavailable", 409) from error
+                temporary_path = None
+                self.transfers.complete(transfer_id)
             return {"transfer_id": transfer_id, "relative_path": relative_target, "size_bytes": written}
         except (TransferCancelled, asyncio.CancelledError):
             self.transfers.cancel(transfer_id)
@@ -182,6 +226,22 @@ class FileService:
             if not body_task.done():
                 body_task.cancel()
                 await asyncio.gather(body_task, return_exceptions=True)
+
+    def _require_upload_authorization(
+        self,
+        authorize_upload: Callable[[], object],
+        transfer_id: str,
+    ) -> None:
+        if self.transfers.cancellation_event(transfer_id).is_set():
+            raise TransferCancelled("Transfer was cancelled.")
+        with self._lock:
+            if not self._uploads_enabled:
+                raise TransferCancelled("The host disabled uploads.")
+        try:
+            authorize_upload()
+        except Exception:
+            self.transfers.cancel(transfer_id)
+            raise
 
     def cleanup(self) -> None:
         self.transfers.cancel_active()

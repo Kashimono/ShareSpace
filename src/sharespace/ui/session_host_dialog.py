@@ -25,7 +25,14 @@ from PySide6.QtWidgets import (
 )
 
 from sharespace.core.device_manager import DeviceManager
-from sharespace.core.models import HostSnapshot, ParticipantRole, ParticipantStatus, PublicSession, TransferStatus
+from sharespace.core.models import (
+    HostSnapshot,
+    ParticipantRole,
+    ParticipantStatus,
+    PermissionLevel,
+    PublicSession,
+    TransferStatus,
+)
 from sharespace.networking.discovery import SessionAdvertiser
 from sharespace.networking.session_client import SessionClient, SessionClientError
 from sharespace.networking.session_server import SessionServer
@@ -109,6 +116,22 @@ class SessionHostDialog(QDialog):
         details.addRow("Participants", self._count_label)
         layout.addLayout(details)
 
+        security = QFormLayout()
+        self._security_status = QLabel("TLS certificate created; local certificate verification is pending.")
+        self._security_status.setWordWrap(True)
+        self._fingerprint_label = QLabel("Starting…")
+        self._fingerprint_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        fingerprint_row = QHBoxLayout()
+        fingerprint_row.addWidget(self._fingerprint_label, 1)
+        self._copy_fingerprint_button = QPushButton("Copy fingerprint")
+        self._copy_fingerprint_button.clicked.connect(lambda _checked=False: self._copy_fingerprint())
+        fingerprint_row.addWidget(self._copy_fingerprint_button)
+        fingerprint_widget = QWidget()
+        fingerprint_widget.setLayout(fingerprint_row)
+        security.addRow("Connection security", self._security_status)
+        security.addRow("SHA-256 fingerprint", fingerprint_widget)
+        layout.addLayout(security)
+
         sharing = QFormLayout()
         self._shared_path = QLabel("No folder selected")
         self._shared_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -166,6 +189,18 @@ class SessionHostDialog(QDialog):
             lambda _current, _previous: self._update_actions()
         )
         participant_column.addWidget(self._participants, 1)
+        permission_actions = QHBoxLayout()
+        self._grant_write_button = QPushButton("Grant READ_WRITE")
+        self._grant_write_button.clicked.connect(
+            lambda _checked=False: self._change_permission(PermissionLevel.READ_WRITE)
+        )
+        self._revoke_write_button = QPushButton("Revoke READ_WRITE")
+        self._revoke_write_button.clicked.connect(
+            lambda _checked=False: self._change_permission(PermissionLevel.READ_ONLY)
+        )
+        permission_actions.addWidget(self._grant_write_button)
+        permission_actions.addWidget(self._revoke_write_button)
+        participant_column.addLayout(permission_actions)
         self._disconnect_button = QPushButton("Disconnect participant")
         self._disconnect_button.clicked.connect(lambda _checked=False: self._disconnect_participant())
         participant_column.addWidget(self._disconnect_button)
@@ -212,6 +247,7 @@ class SessionHostDialog(QDialog):
                 host_device_name=device_manager.hostname,
                 host_os=device_manager.operating_system,
                 host_ip=address.address,
+                host_addresses=tuple(addresses),
             )
             advertiser = SessionAdvertiser(server.manager, device_manager)
             discovery_error = None
@@ -240,9 +276,14 @@ class SessionHostDialog(QDialog):
         runtime = self._runtime
         if runtime is None:
             return
-        self._client = SessionClient(runtime.session.host_ip, runtime.session.port)
+        self._client = SessionClient(
+            runtime.session.host_ip,
+            runtime.session.port,
+            runtime.session.certificate_fingerprint or "",
+        )
         self._name_label.setText(runtime.session.session_name)
         self._id_label.setText(runtime.session.session_id)
+        self._fingerprint_label.setText(runtime.session.certificate_fingerprint or "Unavailable")
         self._code_input.setText(runtime.joining_code)
         addresses = [
             f"{address}:{runtime.session.port}" for address in runtime.host_addresses
@@ -296,11 +337,21 @@ class SessionHostDialog(QDialog):
         self._stream_worker = worker
         self._thread_pool.start(worker)
 
-    def _on_session_event(self, _event: object) -> None:
+    def _on_session_event(self, event: object) -> None:
+        if event.get("type") == "session_security_error":
+            self._security_status.setText(
+                event.get("detail", "The host certificate could not be verified.")
+            )
+            self._security_status.setStyleSheet("color: #b42318; font-weight: 600;")
+            self._status.setText("Secure event connection failed. Review the certificate state.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
         self._refresh_snapshot()
 
     def _on_stream_state(self, state: str) -> None:
-        if state == "disconnected" and self._runtime is not None:
+        if state == "security_error" and self._runtime is not None:
+            self._security_status.setText("TLS certificate validation failed for the live session connection.")
+            self._security_status.setStyleSheet("color: #b42318; font-weight: 600;")
+        elif state == "disconnected" and self._runtime is not None:
             self._status.setText("Session is active; reconnecting to live updates…")
         elif state == "connected" and self._runtime is not None:
             if self._runtime.discovery_error:
@@ -321,6 +372,11 @@ class SessionHostDialog(QDialog):
         self._refresh_busy = False
         snapshot: HostSnapshot = result
         self._count_label.setText(f"{snapshot.session.participant_count} connected")
+        if self._client and self._client.certificate_verified:
+            self._security_status.setText(
+                f"TLS {self._client.tls_version} active; the host certificate is verified."
+            )
+            self._security_status.setStyleSheet("color: #157347; font-weight: 600;")
         current_request_id = (
             self._requests.currentItem().data(Qt.ItemDataRole.UserRole)
             if self._requests.currentItem() is not None
@@ -351,12 +407,17 @@ class SessionHostDialog(QDialog):
         for participant in snapshot.participants:
             label = (
                 f"{participant.device_name} · {participant.operating_system}\n"
-                f"{participant.role.value.title()} · {participant.status.value.title()}"
+                f"{participant.role.value.title()} · {participant.status.value.title()} · "
+                f"{participant.permission.value if participant.permission else 'ADMIN'}"
             )
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, participant.participant_id)
             item.setData(Qt.ItemDataRole.UserRole + 1, participant.role.value)
             item.setData(Qt.ItemDataRole.UserRole + 2, participant.status.value)
+            item.setData(
+                Qt.ItemDataRole.UserRole + 3,
+                participant.permission.value if participant.permission else None,
+            )
             self._participants.addItem(item)
             if participant.participant_id == current_participant_id:
                 selected_participant = item
@@ -372,7 +433,7 @@ class SessionHostDialog(QDialog):
 
     def _choose_shared_folder(self) -> None:
         runtime = self._runtime
-        if runtime is None or self._busy:
+        if runtime is None or self._busy or self._client is None:
             return
         selected = QFileDialog.getExistingDirectory(self, "Choose a folder to share")
         if not selected:
@@ -380,7 +441,9 @@ class SessionHostDialog(QDialog):
         self._busy = True
         self._file_status.setText("Opening the selected folder for file sharing…")
         self._update_actions()
-        worker = SessionWorker(lambda: runtime.server.file_service.select_root(selected))
+        worker = SessionWorker(
+            lambda: self._client.select_shared_root(selected, runtime.host_token)
+        )
         worker.signals.finished.connect(lambda _result: self._shared_folder_changed())
         worker.signals.failed.connect(self._shared_folder_failed)
         self._thread_pool.start(worker)
@@ -397,28 +460,82 @@ class SessionHostDialog(QDialog):
 
     def _stop_sharing(self) -> None:
         runtime = self._runtime
-        if runtime is None or self._busy:
+        if runtime is None or self._busy or self._client is None:
             return
-        runtime.server.file_service.stop_sharing()
-        self._uploads_checkbox.blockSignals(True)
-        self._uploads_checkbox.setChecked(False)
-        self._uploads_checkbox.blockSignals(False)
-        self._refresh_file_state()
+        self._busy = True
+        self._file_status.setText("Stopping file sharing…")
         self._update_actions()
+        worker = SessionWorker(lambda: self._client.stop_sharing(runtime.host_token))
+        worker.signals.finished.connect(lambda _result: self._shared_folder_changed())
+        worker.signals.failed.connect(self._file_control_failed)
+        self._thread_pool.start(worker)
 
     def _toggle_uploads(self, enabled: bool) -> None:
         runtime = self._runtime
-        if runtime is None:
+        if runtime is None or self._client is None or self._busy:
             return
-        try:
-            runtime.server.file_service.set_uploads_enabled(enabled)
-        except Exception as error:
-            self._file_status.setText(f"Could not update upload access: {error}")
-            self._uploads_checkbox.blockSignals(True)
-            self._uploads_checkbox.setChecked(False)
-            self._uploads_checkbox.blockSignals(False)
-            return
+        self._busy = True
+        self._file_status.setText("Updating global upload availability…")
+        self._update_actions()
+        worker = SessionWorker(
+            lambda: self._client.set_uploads_enabled(enabled, runtime.host_token)
+        )
+        worker.signals.finished.connect(lambda _result: self._shared_folder_changed())
+        worker.signals.failed.connect(self._file_control_failed)
+        self._thread_pool.start(worker)
+
+    def _file_control_failed(self, message: str) -> None:
+        self._busy = False
+        self._file_status.setText(f"Could not update file sharing: {message}")
         self._refresh_file_state()
+        self._update_actions()
+
+    def _change_permission(self, permission: PermissionLevel) -> None:
+        runtime = self._runtime
+        item = self._participants.currentItem()
+        if runtime is None or item is None or self._client is None or self._busy:
+            return
+        participant_id = item.data(Qt.ItemDataRole.UserRole)
+        device_name = item.text().splitlines()[0]
+        if permission is PermissionLevel.READ_WRITE:
+            title = "Grant upload access?"
+            detail = (
+                f"Allow {device_name} to upload new files? They still cannot replace, "
+                "modify, rename, or delete shared files."
+            )
+        else:
+            title = "Revoke upload access?"
+            detail = f"Stop {device_name} from uploading files now?"
+        answer = QMessageBox.question(
+            self,
+            title,
+            detail,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._busy = True
+        self._update_actions()
+        worker = SessionWorker(
+            lambda: self._client.set_participant_permission(
+                participant_id, permission.value, runtime.host_token
+            )
+        )
+        worker.signals.finished.connect(self._permission_changed)
+        worker.signals.failed.connect(self._action_failed)
+        self._thread_pool.start(worker)
+
+    def _permission_changed(self, _result: object) -> None:
+        self._busy = False
+        self._refresh_snapshot()
+        self._update_actions()
+
+    def _copy_fingerprint(self) -> None:
+        value = self._fingerprint_label.text()
+        if value and value != "Starting…" and value != "Unavailable":
+            QApplication.clipboard().setText(value)
+            self._security_status.setText("Certificate fingerprint copied. Share it over a trusted channel.")
 
     def _refresh_file_state(self) -> None:
         runtime = self._runtime
@@ -459,14 +576,13 @@ class SessionHostDialog(QDialog):
 
     def _cancel_transfer(self) -> None:
         item = self._transfers.currentItem()
-        if item is None or self._runtime is None:
+        if item is None or self._runtime is None or self._client is None or self._busy:
             return
         transfer_id = item.data(Qt.ItemDataRole.UserRole)
-        try:
-            self._runtime.server.file_service.transfers.cancel(transfer_id)
-        except LookupError:
-            return
-        self._refresh_file_state()
+        runtime = self._runtime
+        self._run_action(
+            lambda: self._client.cancel_host_transfer(transfer_id, runtime.host_token)
+        )
 
     def _resolve_request(self, approve: bool) -> None:
         item = self._requests.currentItem()
@@ -575,6 +691,8 @@ class SessionHostDialog(QDialog):
     def _end_finished(self, failures: object) -> None:
         self._busy = False
         self._runtime = None
+        if self._client is not None:
+            self._client.close()
         self._client = None
         if failures:
             QMessageBox.warning(self, "Session ended with cleanup issues", str(failures))
@@ -605,6 +723,15 @@ class SessionHostDialog(QDialog):
                 and participant_item.data(Qt.ItemDataRole.UserRole + 2) == ParticipantStatus.CONNECTED.value
             )
         self._disconnect_button.setEnabled(can_disconnect)
+        can_change_permission = can_disconnect and participant_item is not None
+        permission = participant_item.data(Qt.ItemDataRole.UserRole + 3) if participant_item else None
+        self._grant_write_button.setEnabled(
+            can_change_permission and permission == PermissionLevel.READ_ONLY.value
+        )
+        self._revoke_write_button.setEnabled(
+            can_change_permission and permission == PermissionLevel.READ_WRITE.value
+        )
+        self._copy_fingerprint_button.setEnabled(available and bool(self._fingerprint_label.text()))
         sharing_available = self._runtime is not None and not self._busy
         self._select_folder_button.setEnabled(sharing_available)
         root_available = sharing_available and self._runtime.server.file_service.directories.root is not None

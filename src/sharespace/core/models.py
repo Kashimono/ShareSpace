@@ -20,6 +20,11 @@ class ParticipantRole(StrEnum):
     PARTICIPANT = "PARTICIPANT"
 
 
+class PermissionLevel(StrEnum):
+    READ_ONLY = "READ_ONLY"
+    READ_WRITE = "READ_WRITE"
+
+
 class ParticipantStatus(StrEnum):
     PENDING = "PENDING"
     CONNECTED = "CONNECTED"
@@ -66,6 +71,7 @@ class PublicSession(BaseModel):
     participant_count: int = Field(ge=1)
     status: SessionStatus
     created_at: datetime
+    certificate_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("session_name", "host_device_name", "host_os")
     @classmethod
@@ -86,6 +92,13 @@ class PublicSession(BaseModel):
         ):
             raise ValueError("Session host address must be a local IPv4 address.")
         return str(address)
+
+    @field_validator("certificate_fingerprint", mode="before")
+    @classmethod
+    def normalize_certificate_fingerprint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return "".join(character for character in value.lower() if character in "0123456789abcdef")
 
 
 class JoinRequestCreate(BaseModel):
@@ -142,6 +155,7 @@ class ParticipantView(BaseModel):
     joined_at: datetime | None = None
     last_heartbeat: datetime | None = None
     role: ParticipantRole
+    permission: PermissionLevel | None = None
 
 
 class HostSnapshot(BaseModel):
@@ -178,10 +192,19 @@ class SharedDirectoryState(BaseModel):
     available: bool
     directory_name: str | None = None
     uploads_enabled: bool = False
+    permission: PermissionLevel | None = None
 
 
 class UploadSettingUpdate(BaseModel):
     enabled: bool
+
+
+class ParticipantPermissionUpdate(BaseModel):
+    permission: PermissionLevel
+
+
+class SharedDirectoryUpdate(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
 
 
 class TransferView(BaseModel):

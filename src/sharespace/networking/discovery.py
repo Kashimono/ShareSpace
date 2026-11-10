@@ -133,8 +133,8 @@ class SessionAdvertiser:
 
     @staticmethod
     def _properties(session: PublicSession) -> dict[str, bytes]:
-        return {
-            "protocol": b"1",
+        properties = {
+            "protocol": b"2",
             "session_id": session.session_id.encode("ascii"),
             "session_name": _txt_value(session.session_name),
             "host_name": _txt_value(session.host_device_name),
@@ -143,6 +143,9 @@ class SessionAdvertiser:
             "status": session.status.value.encode("ascii"),
             "created_at": session.created_at.isoformat().encode("ascii"),
         }
+        if session.certificate_fingerprint is not None:
+            properties["certificate_fingerprint"] = session.certificate_fingerprint.encode("ascii")
+        return properties
 
 
 @dataclass(frozen=True)
@@ -246,7 +249,7 @@ class SessionDiscovery:
             if info is None:
                 return
             properties = {key.decode("utf-8"): value for key, value in info.properties.items()}
-            if self._property(properties, "protocol") != "1":
+            if self._property(properties, "protocol") != "2":
                 return
             session_id = self._property(properties, "session_id")
             status = self._property(properties, "status")
@@ -271,7 +274,10 @@ class SessionDiscovery:
                 participant_count=max(1, int(self._property(properties, "participant_count") or "1")),
                 status=SessionStatus.ACTIVE,
                 created_at=created_at,
+                certificate_fingerprint=self._property(properties, "certificate_fingerprint"),
             )
+            if public.certificate_fingerprint is None:
+                return
         except Exception as error:
             logger.debug("Ignored invalid ShareSpace mDNS advertisement %s: %s", name, error)
             return

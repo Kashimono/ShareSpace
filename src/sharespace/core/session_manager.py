@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from sharespace.core.models import (
     JoinRequestStatus,
     JoinRequestView,
+    PermissionLevel,
     ParticipantRole,
     ParticipantStatus,
     ParticipantView,
@@ -64,6 +65,7 @@ class _Participant:
     joined_at: datetime | None = None
     last_heartbeat: datetime | None = None
     token_digest: bytes | None = None
+    permission: PermissionLevel | None = PermissionLevel.READ_ONLY
 
     def view(self) -> ParticipantView:
         return ParticipantView(
@@ -74,6 +76,7 @@ class _Participant:
             joined_at=self.joined_at,
             last_heartbeat=self.last_heartbeat,
             role=self.role,
+            permission=self.permission,
         )
 
 
@@ -143,6 +146,7 @@ class SessionManager:
         host_os: str,
         host_ip: str,
         port: int,
+        certificate_fingerprint: str | None = None,
         now: datetime | None = None,
     ) -> tuple[PublicSession, SessionCredentials]:
         """Create session state and return the host's one-time credentials."""
@@ -177,6 +181,7 @@ class SessionManager:
             participant_count=1,
             status=SessionStatus.ACTIVE,
             created_at=current,
+            certificate_fingerprint=certificate_fingerprint,
         )
         participant = _Participant(
             participant_id=host_participant_id,
@@ -185,6 +190,7 @@ class SessionManager:
             operating_system=host_os,
             status=ParticipantStatus.CONNECTED,
             role=ParticipantRole.HOST,
+            permission=None,
             joined_at=current,
             last_heartbeat=current,
         )
@@ -347,6 +353,57 @@ class SessionManager:
             ):
                 raise InvalidCredential("Participant is not connected.")
             return participant.view()
+
+    def require_participant_permission(
+        self,
+        participant_token: str,
+        required: PermissionLevel,
+    ) -> ParticipantView:
+        with self._lock:
+            self._active_session()
+            participant = self._participant_for_token(participant_token)
+            if (
+                participant.role is not ParticipantRole.PARTICIPANT
+                or participant.status is not ParticipantStatus.CONNECTED
+            ):
+                raise InvalidCredential("Participant is not connected.")
+            if required is PermissionLevel.READ_WRITE and participant.permission is not PermissionLevel.READ_WRITE:
+                raise PermissionDenied("This participant does not have upload permission.")
+            return participant.view()
+
+    def set_participant_permission(
+        self,
+        participant_id: str,
+        permission: PermissionLevel,
+        host_token: str,
+    ) -> ParticipantView:
+        """Change a participant's server-owned access level using host credentials."""
+        if not isinstance(permission, PermissionLevel):
+            try:
+                permission = PermissionLevel(permission)
+            except (TypeError, ValueError) as error:
+                raise ValueError("Permission must be READ_ONLY or READ_WRITE.") from error
+        with self._lock:
+            self._require_host(host_token)
+            participant = self._participants.get(participant_id)
+            if (
+                participant is None
+                or participant.role is not ParticipantRole.PARTICIPANT
+                or participant.status not in {ParticipantStatus.CONNECTED, ParticipantStatus.DISCONNECTED}
+            ):
+                raise SessionUnavailable("An approved participant was not found.")
+            participant.permission = permission
+            return participant.view()
+
+    def connected_participant_ids(self) -> set[str]:
+        """Return connected ordinary participant IDs for transfer cleanup."""
+        with self._lock:
+            return {
+                item.participant_id
+                for item in self._participants.values()
+                if item.role is ParticipantRole.PARTICIPANT
+                and item.status is ParticipantStatus.CONNECTED
+            }
 
     def heartbeat(self, participant_token: str, *, now: datetime | None = None) -> ParticipantView:
         current = now or self._now()

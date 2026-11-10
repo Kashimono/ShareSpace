@@ -8,6 +8,7 @@ import uuid
 
 from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QFormLayout,
     QHBoxLayout,
@@ -21,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from sharespace.core.device_manager import DeviceManager
-from sharespace.core.models import JoinRequestCreated, JoinRequestStatus, PublicSession
+from sharespace.core.models import JoinRequestCreated, JoinRequestStatus, PermissionLevel, PublicSession
 from sharespace.networking.discovery import SessionDiscovery
 from sharespace.networking.file_client import FileClient
 from sharespace.networking.session_client import SessionClient
@@ -43,6 +44,8 @@ class SessionJoinDialog(QDialog):
         self._endpoint: tuple[str, int] | None = None
         self._manual_selection = False
         self._client: SessionClient | None = None
+        self._file_browser: FileBrowserDialog | None = None
+        self._permission = PermissionLevel.READ_ONLY
         self._request_id: str | None = None
         self._request_token: str | None = None
         self._participant_token: str | None = None
@@ -84,9 +87,18 @@ class SessionJoinDialog(QDialog):
         manual_form = QFormLayout()
         self._host_input = QLineEdit()
         self._host_input.setPlaceholderText("192.168.1.20")
+        self._host_input.textChanged.connect(lambda _text: self._manual_endpoint_changed())
         self._port_input = QLineEdit()
         self._port_input.setPlaceholderText("Host port")
-        self._manual_button = QPushButton("Connect manually")
+        self._port_input.textChanged.connect(lambda _text: self._manual_endpoint_changed())
+        self._fingerprint_input = QLineEdit()
+        self._fingerprint_input.setPlaceholderText("64 hex characters, SHA-256")
+        self._fingerprint_input.textChanged.connect(lambda _text: self._fingerprint_changed())
+        self._trust_confirmation = QCheckBox(
+            "I compared this fingerprint with the host through a trusted channel"
+        )
+        self._trust_confirmation.toggled.connect(lambda _checked: self._update_buttons())
+        self._manual_button = QPushButton("Verify host certificate")
         self._manual_button.clicked.connect(lambda _checked=False: self._connect_manually())
         manual_row = QHBoxLayout()
         manual_row.addWidget(self._host_input, 1)
@@ -95,7 +107,15 @@ class SessionJoinDialog(QDialog):
         manual_widget = QWidget()
         manual_widget.setLayout(manual_row)
         manual_form.addRow("Host IPv4 address and port", manual_widget)
+        manual_form.addRow("SHA-256 certificate fingerprint", self._fingerprint_input)
+        manual_form.addRow("Trust check", self._trust_confirmation)
         layout.addLayout(manual_form)
+        self._security_status = QLabel(
+            "Compare the fingerprint with the host using a trusted channel. "
+            "Local network discovery alone does not verify host identity."
+        )
+        self._security_status.setWordWrap(True)
+        layout.addWidget(self._security_status)
 
         join_form = QFormLayout()
         self._code_input = QLineEdit()
@@ -180,11 +200,39 @@ class SessionJoinDialog(QDialog):
                 selected_row = index
         if selected_row >= 0:
             self._sessions.setCurrentRow(selected_row)
-            self._selected_session = sessions[selected_row]
-            self._endpoint = (sessions[selected_row].host_ip, sessions[selected_row].port)
-        elif self._selected_session is not None and not self._manual_selection:
+            fresh_session = sessions[selected_row]
+            if not self._manual_selection and self._client is None:
+                address_changed = self._endpoint != (fresh_session.host_ip, fresh_session.port)
+                fingerprint_changed = (
+                    self._selected_session is not None
+                    and self._selected_session.certificate_fingerprint
+                    != fresh_session.certificate_fingerprint
+                )
+                self._endpoint = (fresh_session.host_ip, fresh_session.port)
+                if address_changed or fingerprint_changed:
+                    for field in (self._host_input, self._port_input, self._fingerprint_input):
+                        field.blockSignals(True)
+                    self._host_input.setText(fresh_session.host_ip)
+                    self._port_input.setText(str(fresh_session.port))
+                    self._fingerprint_input.setText(fresh_session.certificate_fingerprint or "")
+                    for field in (self._host_input, self._port_input, self._fingerprint_input):
+                        field.blockSignals(False)
+                    self._trust_confirmation.setChecked(False)
+                    if fingerprint_changed:
+                        self._security_status.setText(
+                            "The advertised certificate fingerprint changed. Compare it again through a trusted channel."
+                        )
+            self._selected_session = fresh_session
+        elif (
+            self._selected_session is not None
+            and not self._manual_selection
+            and self._request_id is None
+            and self._participant_token is None
+        ):
             self._selected_session = None
             self._endpoint = None
+            self._trust_confirmation.setChecked(False)
+            self._clear_verified_client()
             self._selected_label.setText("Select a session or connect manually.")
             if self._request_id is None:
                 self._status.setText("The selected session is unavailable.")
@@ -212,10 +260,48 @@ class SessionJoinDialog(QDialog):
             self._selected_session = session
             self._endpoint = (session.host_ip, session.port)
             self._manual_selection = False
+            for field in (self._host_input, self._port_input, self._fingerprint_input):
+                field.blockSignals(True)
+            self._host_input.setText(session.host_ip)
+            self._port_input.setText(str(session.port))
+            self._fingerprint_input.setText(session.certificate_fingerprint or "")
+            for field in (self._host_input, self._port_input, self._fingerprint_input):
+                field.blockSignals(False)
+            self._trust_confirmation.setChecked(False)
+            self._clear_verified_client()
+            self._security_status.setText(
+                "Compare the advertised fingerprint with the host over a trusted channel, then confirm below."
+            )
             self._selected_label.setText(
                 f"Selected: {session.session_name} on {session.host_device_name}"
             )
             self._update_buttons()
+
+    def _manual_endpoint_changed(self) -> None:
+        self._manual_selection = True
+        self._selected_session = None
+        self._endpoint = None
+        self._trust_confirmation.setChecked(False)
+        self._clear_verified_client()
+        self._selected_label.setText("Manual host details changed. Verify the host again.")
+        self._update_buttons()
+
+    def _fingerprint_changed(self) -> None:
+        expected = "".join(
+            character for character in self._fingerprint_input.text().lower()
+            if character in "0123456789abcdef"
+        )
+        self._trust_confirmation.setChecked(False)
+        if self._client is not None and expected != self._client.security.expected_fingerprint:
+            self._clear_verified_client()
+        self._update_buttons()
+
+    def _clear_verified_client(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+        self._participant_connected = False
+        self._update_buttons()
 
     def _connect_manually(self) -> None:
         if self._join_busy:
@@ -230,6 +316,14 @@ class SessionJoinDialog(QDialog):
             port = int(self._port_input.text().strip())
             if not 1 <= port <= 65535:
                 raise ValueError("Port must be between 1 and 65535.")
+            fingerprint = "".join(
+                character for character in self._fingerprint_input.text().lower()
+                if character in "0123456789abcdef"
+            )
+            if len(fingerprint) != 64:
+                raise ValueError("Enter the complete 64-character SHA-256 certificate fingerprint.")
+            if not self._trust_confirmation.isChecked():
+                raise ValueError("Confirm that you compared the fingerprint through a trusted channel.")
         except ValueError as error:
             self._status.setText(str(error) or "Enter a valid local host IPv4 address and port.")
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
@@ -238,25 +332,37 @@ class SessionJoinDialog(QDialog):
         self._join_busy = True
         self._status.setText("Checking the ShareSpace host…")
         self._update_buttons()
-        client = SessionClient(host_ip, port)
+        self._clear_verified_client()
+        client = SessionClient(host_ip, port, fingerprint)
         worker = SessionWorker(lambda: client.get_public_session())
-        worker.signals.finished.connect(lambda result: self._manual_session_found(result, host_ip, port))
-        worker.signals.failed.connect(self._manual_session_failed)
+        worker.signals.finished.connect(
+            lambda result: self._manual_session_found(result, host_ip, port, client)
+        )
+        worker.signals.failed.connect(lambda message: self._manual_session_failed(message, client))
         self._thread_pool.start(worker)
 
-    def _manual_session_found(self, result: object, host_ip: str, port: int) -> None:
+    def _manual_session_found(
+        self, result: object, host_ip: str, port: int, client: SessionClient
+    ) -> None:
         self._join_busy = False
         self._selected_session = result
         self._endpoint = (host_ip, port)
-        self._manual_selection = True
+        self._client = client
         self._selected_label.setText(f"Manual host: {result.session_name} on {result.host_device_name}")
-        self._status.setText("Session available. Enter its joining code to request access.")
+        self._status.setText("Host identity verified. Enter its joining code to request access.")
         self._status.setStyleSheet("color: #157347; font-weight: 600;")
+        self._security_status.setText(
+            f"TLS {client.tls_version} active. Verified fingerprint: {result.certificate_fingerprint}"
+        )
+        self._security_status.setStyleSheet("color: #157347; font-weight: 600;")
         self._update_buttons()
 
-    def _manual_session_failed(self, message: str) -> None:
+    def _manual_session_failed(self, message: str, client: SessionClient) -> None:
         self._join_busy = False
+        client.close()
         self._status.setText(f"Connection failed: {message}")
+        self._security_status.setText("Host certificate verification did not complete.")
+        self._security_status.setStyleSheet("color: #b42318; font-weight: 600;")
         self._status.setStyleSheet("color: #b42318; font-weight: 600;")
         self._update_buttons()
 
@@ -280,7 +386,13 @@ class SessionJoinDialog(QDialog):
         self._status.setStyleSheet("color: #4357c5; font-weight: 600;")
         self._update_buttons()
         device = DeviceManager()
-        client = SessionClient(*endpoint)
+        client = self._client
+        if client is None or not client.certificate_verified:
+            self._join_busy = False
+            self._status.setText("Verify the host fingerprint before requesting access.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+            self._update_buttons()
+            return
         operation = lambda: client.request_join(
             session_id=session.session_id,
             client_id=self._client_id,
@@ -383,13 +495,45 @@ class SessionJoinDialog(QDialog):
     def _on_session_event(self, event: object) -> None:
         if event.get("type") == "authenticated":
             self._participant_id = event.get("participant_id")
+            self._permission = PermissionLevel(
+                event.get("permission", PermissionLevel.READ_ONLY.value)
+            )
             self._participant_connected = True
+            if self._file_browser is not None:
+                self._file_browser.apply_permission(self._permission)
             self._update_buttons()
+        elif event.get("type") == "participant_permission_changed":
+            self._permission = PermissionLevel(event["permission"])
+            if self._file_browser is not None:
+                self._file_browser.apply_permission(self._permission)
+            self._update_buttons()
+        elif event.get("type") == "file_sharing_state_changed":
+            if self._file_browser is not None:
+                self._file_browser.apply_sharing_state(
+                    available=bool(event.get("available")),
+                    uploads_enabled=bool(event.get("uploads_enabled")),
+                    directory_name=event.get("directory_name"),
+                )
         elif event.get("type") == "session_ended":
             self._participant_connected = False
             self._poll_timer.stop()
             self._status.setText("The host ended the session.")
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+            if self._file_browser is not None:
+                self._file_browser.set_session_unavailable("The host ended the session.")
+        elif event.get("type") == "session_security_error":
+            self._participant_connected = False
+            self._stream_stop.set()
+            detail = event.get("detail", "The host certificate could not be verified.")
+            presented = event.get("presented_fingerprint")
+            if presented:
+                detail += f" Presented fingerprint: {presented}"
+            self._security_status.setText(detail)
+            self._security_status.setStyleSheet("color: #b42318; font-weight: 600;")
+            self._status.setText("Secure session connection failed. Verify the host fingerprint again.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+            if self._file_browser is not None:
+                self._file_browser.set_session_unavailable(detail)
         elif (
             event.get("type") == "participant_disconnected"
             and event.get("participant_id") == self._participant_id
@@ -398,23 +542,36 @@ class SessionJoinDialog(QDialog):
             self._stream_stop.set()
             self._status.setText("The host disconnected this device from the session.")
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+            if self._file_browser is not None:
+                self._file_browser.set_session_unavailable(
+                    "The host disconnected this device from the session."
+                )
 
     def _on_stream_state(self, state: str) -> None:
         if state == "connected" and self._participant_token:
             self._participant_connected = True
-            self._status.setText("Connected to the ShareSpace session.")
+            tls = self._client.tls_version if self._client else "TLS"
+            self._status.setText(f"Connected securely to the ShareSpace session using {tls}.")
             self._status.setStyleSheet("color: #157347; font-weight: 600;")
         elif state == "disconnected" and self._participant_token:
             self._participant_connected = False
             self._status.setText("Session connection interrupted; trying to reconnect…")
             self._status.setStyleSheet("color: #9a6700; font-weight: 600;")
+        elif state == "security_error":
+            self._participant_connected = False
         self._update_buttons()
 
     def _open_file_browser(self) -> None:
         if not self._participant_connected or not self._participant_token or self._endpoint is None:
             return
-        client = FileClient(*self._endpoint, self._participant_token)
-        FileBrowserDialog(client, self).exec()
+        if self._client is None:
+            return
+        client = FileClient(
+            *self._endpoint, self._participant_token, security=self._client.security
+        )
+        self._file_browser = FileBrowserDialog(client, self, permission=self._permission)
+        self._file_browser.exec()
+        self._file_browser = None
 
     def _update_buttons(self) -> None:
         can_join = (
@@ -423,13 +580,24 @@ class SessionJoinDialog(QDialog):
             and self._request_id is None
             and not self._join_busy
             and bool(self._code_input.text().strip())
+            and self._client is not None
+            and self._client.certificate_verified
+            and self._trust_confirmation.isChecked()
+            and self._client.security.expected_fingerprint == "".join(
+                character for character in self._fingerprint_input.text().lower()
+                if character in "0123456789abcdef"
+            )
         )
         self._join_button.setEnabled(can_join)
         self._manual_button.setEnabled(not self._join_busy and self._request_id is None)
         self._refresh_button.setEnabled(not self._discovery_busy)
-        self._host_input.setEnabled(self._request_id is None)
-        self._port_input.setEnabled(self._request_id is None)
-        self._code_input.setEnabled(self._request_id is None)
+        editable = not self._join_busy and self._request_id is None
+        self._sessions.setEnabled(editable)
+        self._host_input.setEnabled(editable)
+        self._port_input.setEnabled(editable)
+        self._fingerprint_input.setEnabled(editable)
+        self._trust_confirmation.setEnabled(editable)
+        self._code_input.setEnabled(editable)
         self._browse_button.setEnabled(
             self._participant_connected and bool(self._participant_token) and self._endpoint is not None
         )
@@ -440,4 +608,6 @@ class SessionJoinDialog(QDialog):
         self._discovery_timer.stop()
         if self._discovery.active:
             self._thread_pool.start(SessionWorker(self._discovery.stop))
+        if self._client is not None:
+            self._client.close()
         super().closeEvent(event)

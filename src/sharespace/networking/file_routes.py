@@ -7,16 +7,24 @@ import binascii
 import uuid
 
 from fastapi import APIRouter, Header, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from sharespace.core.file_manager import FileAccessError, MAX_FILE_SIZE_BYTES
-from sharespace.core.models import ApiError, SharedDirectoryState, TransferView, UploadSettingUpdate
+from sharespace.core.models import (
+    PermissionLevel,
+    SharedDirectoryState,
+    SharedDirectoryUpdate,
+    TransferView,
+    UploadSettingUpdate,
+)
 from sharespace.core.session_manager import InvalidCredential, PermissionDenied, SessionManager
 from sharespace.core.transfer_manager import TransferCancelled, TransferNotFound
 from sharespace.networking.file_service import FileService, content_disposition, guess_content_type
 
 
-def create_file_router(manager: SessionManager, file_service: FileService) -> APIRouter:
+def create_file_router(
+    manager: SessionManager, file_service: FileService, *, event_broker=None
+) -> APIRouter:
     router = APIRouter()
 
     def token_value(authorization: str | None, *, host: bool = False) -> str:
@@ -37,10 +45,21 @@ def create_file_router(manager: SessionManager, file_service: FileService) -> AP
             raise PermissionDenied("Host credentials are invalid or expired.")
         return token
 
+    async def publish_file_state() -> SharedDirectoryState:
+        state = file_service.state()
+        if event_broker is not None:
+            await event_broker.publish({
+                "type": "file_sharing_state_changed",
+                "available": state.available,
+                "uploads_enabled": state.uploads_enabled,
+                "directory_name": state.directory_name,
+            })
+        return state
+
     @router.get("/api/v1/files/settings", response_model=SharedDirectoryState)
     async def file_settings(authorization: str | None = Header(default=None)) -> SharedDirectoryState:
-        participant(authorization)
-        return file_service.state()
+        peer = participant(authorization)
+        return file_service.state().model_copy(update={"permission": peer.permission})
 
     @router.get("/api/v1/files", response_model=None)
     async def browse_files(
@@ -92,7 +111,8 @@ def create_file_router(manager: SessionManager, file_service: FileService) -> AP
         transfer_id: str | None = Header(default=None, alias="X-Transfer-ID"),
         authorization: str | None = Header(default=None),
     ):
-        peer = participant(authorization)
+        participant_token = token_value(authorization)
+        peer = manager.require_participant_permission(participant_token, PermissionLevel.READ_WRITE)
         if not file_service.uploads_enabled:
             raise FileAccessError("The host has not enabled uploads.", "uploads_disabled", 403)
         if filename_header is None:
@@ -136,6 +156,9 @@ def create_file_router(manager: SessionManager, file_service: FileService) -> AP
             transfer_id=identifier,
             participant_id=peer.participant_id,
             body=next_chunk,
+            authorize_upload=lambda: manager.require_participant_permission(
+                participant_token, PermissionLevel.READ_WRITE
+            ),
         )
 
     @router.get("/api/v1/files/transfers", response_model=list[TransferView])
@@ -150,7 +173,7 @@ def create_file_router(manager: SessionManager, file_service: FileService) -> AP
     ):
         peer = participant(authorization)
         identifier = _valid_transfer_id(transfer_id)
-        return file_service.transfers.cancel(identifier, participant_id=peer.participant_id)
+        return await file_service.cancel_transfer(identifier, participant_id=peer.participant_id)
 
     @router.get("/api/v1/host/files/state", response_model=SharedDirectoryState)
     async def host_file_state(authorization: str | None = Header(default=None)):
@@ -165,8 +188,23 @@ def create_file_router(manager: SessionManager, file_service: FileService) -> AP
         host(authorization)
         if data.enabled and file_service.directories.root is None:
             raise FileAccessError("Select a shared directory before enabling uploads.", "sharing_unavailable", 409)
-        file_service.set_uploads_enabled(data.enabled)
-        return file_service.state()
+        await file_service.set_uploads_enabled_guarded(data.enabled)
+        return await publish_file_state()
+
+    @router.post("/api/v1/host/files/root", response_model=SharedDirectoryState)
+    async def host_select_shared_root(
+        data: SharedDirectoryUpdate,
+        authorization: str | None = Header(default=None),
+    ):
+        host(authorization)
+        await file_service.select_root_guarded(data.path)
+        return await publish_file_state()
+
+    @router.post("/api/v1/host/files/stop", response_model=SharedDirectoryState)
+    async def host_stop_sharing(authorization: str | None = Header(default=None)):
+        host(authorization)
+        await file_service.stop_sharing_guarded()
+        return await publish_file_state()
 
     @router.get("/api/v1/host/files/transfers", response_model=list[TransferView])
     async def host_transfers(authorization: str | None = Header(default=None)):
@@ -176,7 +214,7 @@ def create_file_router(manager: SessionManager, file_service: FileService) -> AP
     @router.post("/api/v1/host/files/transfers/{transfer_id}/cancel", response_model=TransferView)
     async def host_cancel_transfer(transfer_id: str, authorization: str | None = Header(default=None)):
         host(authorization)
-        return file_service.transfers.cancel(_valid_transfer_id(transfer_id))
+        return await file_service.cancel_transfer(_valid_transfer_id(transfer_id))
 
     return router
 

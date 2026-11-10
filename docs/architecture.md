@@ -1,221 +1,208 @@
 # ShareSpace architecture
 
-Version 0.4.0 adds a local file-sharing layer above the Version 0.3 session layer and
-Version 0.2 platform adapters.
-The existing Windows and Linux hotspot implementations remain separate and are not
-used by the session state machine. Hosting on an existing local network is also
-supported so session work can be exercised when a platform cannot create a hotspot.
+Version 0.5.0 adds participant upload permissions and encrypted local sessions to the
+Version 0.4 file-sharing engine. It keeps the existing FastAPI/Uvicorn server,
+WebSocket event stream, Qt UI, and separate Windows and Linux hotspot adapters.
+Sessions and certificates work offline; there is no public certificate authority or
+cloud dependency.
 
 ## Module boundaries
 
 ### Shared core
 
-- `sharespace.core.models` contains validated public session, join request, participant,
-  and state models shared by the API and UI.
-- `sharespace.core.session_manager.SessionManager` owns one in-memory session. It
-  creates IDs and credentials, validates join codes, records requests and participants,
-  enforces host-only operations, handles heartbeats, and expires stale state. It has no
-  Qt or network dependency.
-- `sharespace.core.file_manager.SharedDirectoryManager` owns one host-selected root,
-  accepts only relative protocol paths, filters hidden items, rejects symbolic links
-  and Windows reparse points, and checks resolved paths stay inside the root.
-- `sharespace.core.transfer_manager.TransferManager` tracks transfer byte counts,
-  status, cancellation, and a bounded in-memory history. It stores no file content.
-- `sharespace.core.device_manager.DeviceManager` reports the device name, OS, and usable
-  local IPv4 addresses. It prefers the hotspot address when the user selected the
-  existing hotspot workflow. It never chooses a globally routable address as the host
-  address.
+- `sharespace.core.models` defines validated session, participant, permission,
+  directory, and transfer models shared by the API and UI.
+- `sharespace.core.session_manager.SessionManager` owns in-memory session state,
+  credentials, join approval, participant identity, heartbeats, and permissions. Each
+  approved participant starts as `READ_ONLY`. It is the authority for role, active
+  connection, and permission; the client never supplies these values.
+- `sharespace.core.file_manager.SharedDirectoryManager` owns the host-selected root,
+  relative-path validation, hidden-item filtering, symlink/reparse rejection, and
+  confinement checks.
+- `sharespace.core.transfer_manager.TransferManager` tracks transfer state, byte
+  counts, cancellation, and bounded in-memory history. It stores no file content.
+- `sharespace.core.device_manager.DeviceManager` identifies the device and available
+  local IPv4 addresses and selects the host address without hardcoding it.
 
 ### Local networking
 
-- `sharespace.networking.session_server.create_session_app` creates the FastAPI HTTP
-  and WebSocket application. `SessionServer` binds a socket to `0.0.0.0` on port zero,
-  starts Uvicorn in a background thread, and returns the actual selected port.
-- `sharespace.networking.discovery.SessionAdvertiser` publishes the active session
-  through Zeroconf/mDNS on `_sharespace._tcp.local.`. It refreshes metadata every 15
-  seconds and sends a goodbye record on orderly shutdown. `SessionDiscovery` resolves,
-  deduplicates, and expires service records after 180 seconds without an update.
-- `sharespace.networking.session_client.SessionClient` provides asynchronous HTTP
-  calls and an authenticated WebSocket event stream. Participant clients send a
-  heartbeat every five seconds and reconnect after temporary transport failures.
-- `sharespace.networking.session_server.EventBroker` fans out session events to
-  connected WebSocket clients and allows one live WebSocket per participant identity.
-- `sharespace.networking.file_service.FileService` attaches to each session server
-  and owns root settings, upload state, temporary uploads, and streaming operations.
-- `sharespace.networking.file_routes` adds authenticated browse, metadata, download,
-  upload, transfer status, and cancellation routes to the FastAPI app.
-- `sharespace.networking.file_client.FileClient` streams files and creates local
-  downloads without replacing existing files.
+- `sharespace.networking.tls_security.SessionCertificateManager` creates one
+  ephemeral self-signed RSA certificate and private key per host session. IP SANs
+  cover all supplied local addresses and loopback addresses. The SHA-256 fingerprint
+  is attached to public session metadata. Temporary key files are removed when the
+  server stops. POSIX permissions are set to `0600` for files and `0700` for the
+  directory; Windows uses the inherited access-control list of its temporary folder.
+- `TLSConnectionSecurity` first inspects the peer certificate without sending HTTP,
+  WebSocket data, or credentials. It compares the DER certificate's SHA-256 hash to
+  the expected fingerprint, then creates a strict TLS context that requires the
+  pinned certificate, validates its lifetime, and checks the host IP against the
+  certificate SAN. TLS 1.2 is the minimum. There is no HTTP/WSS plaintext fallback.
+- `sharespace.networking.session_server.SessionServer` binds a local socket and starts
+  Uvicorn with the session certificate and key. HTTPS hosts the REST endpoints and
+  WSS hosts the event endpoint. Startup and shutdown clean up the key material.
+- `sharespace.networking.session_client.SessionClient` reuses a thread-safe HTTPX
+  connection pool for HTTPS API requests and uses the same pin for WSS, approval,
+  host controls, heartbeat events, and file-service control requests.
+- `sharespace.networking.discovery.SessionAdvertiser` publishes public metadata on
+  `_sharespace._tcp.local.` using protocol version 2. Discovery includes the
+  fingerprint so the participant can compare it, but mDNS is not an independent
+  trusted channel.
+- `sharespace.networking.file_routes` authenticates every file operation. Browsing,
+  metadata, and download require a currently connected participant. Upload additionally
+  requires `READ_WRITE` and the host's global upload switch.
+- `sharespace.networking.file_service.FileService` streams 64 KiB chunks. Its async
+  authorization gate serializes permission changes, host upload toggles, participant
+  disconnects, root changes, chunk writes, and final file publication. It cancels
+  active uploads when access is revoked and removes incomplete temporary files.
+- `sharespace.networking.file_client.FileClient` verifies the pinned certificate for
+  file operations, streams without loading whole files into memory, and creates local
+  download files without overwriting an existing destination.
 
 ### Qt presentation
 
-- `HostSessionDialog` retains adapter detection, compatibility checks, and the
-  Version 0.2 hotspot controls. It adds two entry paths: **Host on this network**, or
-  **Host using this hotspot** after a hotspot has been created.
-- `SessionHostDialog` displays the session ID, joining code, address and port, pending
-  requests, and participant states. It performs approval, rejection, disconnect, and
-  session teardown.
-- `SessionJoinDialog` discovers sessions, supports a manual local IPv4 address and
-  port, submits a join request, polls approval status, monitors the WebSocket, and
-  opens the authenticated participant file browser when connected.
-- `FileBrowserDialog` displays relative contents, downloads, optional uploads,
-  transfer progress, and cancellation controls.
-- `SessionHostDialog` selects or stops the shared root, controls uploads (off by
-  default), and displays or cancels active transfers.
-- `sharespace.ui.session_workers` runs blocking setup and asynchronous network work in
-  Qt worker threads. The presentation thread handles only widget updates and cached
-  discovery snapshots.
+- `HostSessionDialog` preserves the existing hotspot and network choices.
+- `SessionHostDialog` shows the security status, negotiated TLS version, session
+  fingerprint, requests, participant roles/status/permission, global upload setting,
+  and transfer state. The host can copy the fingerprint, grant/revoke `READ_WRITE`,
+  disconnect participants, and stop sharing.
+- `SessionJoinDialog` shows the expected fingerprint. It requires the participant to
+  affirm an independent trusted-channel comparison before verification and before the
+  joining code is sent. TLS errors and replacement fingerprints are surfaced to the
+  participant.
+- `FileBrowserDialog` keeps browsing and downloading available to `READ_ONLY`
+  participants. Upload controls require both `READ_WRITE` and the globally enabled
+  upload state. It updates when a targeted permission event arrives.
+- `sharespace.ui.session_workers` runs blocking setup and network work away from the
+  Qt presentation thread.
 
-### Platform adapters
+The Windows and Linux hotspot implementations remain in their platform-specific
+modules. TLS, session logic, file services, and permissions are shared.
 
-`sharespace.platform.base_hotspot`, `platform_manager`, `platform.windows`, and
-`platform.linux` are unchanged by this milestone. They retain OS-specific hotspot
-behavior behind the shared adapter interface. The Windows `wiFiControl` package
-capability and connection-profile limitations documented for Version 0.2 remain in
-force.
-
-## Session startup and shutdown
+## Session, permission, and trust flow
 
 ```mermaid
 sequenceDiagram
-    participant UI as Host UI
-    participant Device as DeviceManager
-    participant Server as SessionServer / FastAPI
-    participant Core as SessionManager
-    participant MDNS as Zeroconf
-    UI->>Device: Select local IPv4 address
-    UI->>Server: Start with session name and host identity
-    Server->>Server: Bind 0.0.0.0:0 and start Uvicorn thread
-    Server->>Core: Create session with assigned port
-    Server-->>UI: Public session, host token, joining code
-    UI->>MDNS: Advertise public metadata
-    UI->>UI: Show host dashboard and WebSocket event stream
-    UI->>MDNS: Withdraw service on End Session
-    UI->>Core: End session using host token
-    UI->>Server: Stop Uvicorn and release socket
-    UI->>Device: Stop owned hotspot if this flow created it
+    participant Host as Host UI
+    participant Server as TLS SessionServer
+    participant Peer as Participant UI
+    Host->>Server: Generate ephemeral certificate and start HTTPS/WSS
+    Server-->>Host: Session address, joining code, SHA-256 fingerprint
+    Host->>Peer: Share address, joining code, fingerprint through trusted channel
+    Peer->>Server: Credential-free certificate inspection handshake
+    Peer->>Peer: Compare fingerprint and require confirmation
+    Peer->>Server: HTTPS GET session and submit join request
+    Host->>Server: Approve request using host bearer token
+    Peer->>Server: Poll approval, authenticate WSS
+    Server-->>Peer: Authenticated event with READ_ONLY permission
+    Host->>Server: Grant READ_WRITE over HTTPS
+    Server-->>Peer: Targeted permission change event over WSS
+    Peer->>Server: Upload over HTTPS only if READ_WRITE and global switch enabled
 ```
 
-The session ID is a random UUID. The joining code is a 12-character value selected
-from an alphabet that omits visually ambiguous characters. The server port is
-selected by the operating system; neither the code nor the session ID is used as a
-network address. No host IP is hardcoded.
+The joining code is a 12-character secret; host, request, and participant credentials
+are generated with `secrets`. The joining code is stored as a salted PBKDF2-HMAC-SHA256
+digest in memory and failed code attempts are rate-limited. Approved participant
+tokens are temporarily available only through the matching request token. Disconnect
+and session-end operations revoke credentials. Active state is not persisted.
 
-## State model
+## Participant permissions and upload evaluation
 
-```mermaid
-stateDiagram-v2
-    [*] --> PENDING: request received
-    PENDING --> APPROVED: host approves
-    PENDING --> REJECTED: host rejects
-    PENDING --> EXPIRED: request timeout
-    APPROVED --> CONNECTED: participant WebSocket authenticates
-    CONNECTED --> DISCONNECTED: socket closes or heartbeat expires
-    DISCONNECTED --> CONNECTED: reconnect before timeout revokes token
-    CONNECTED --> DISCONNECTED: host disconnects participant
-```
+The host is reported separately with role `HOST` and no participant permission.
+Ordinary approved participants have one of:
 
-The host is a participant with role `HOST`; ordinary devices use `PARTICIPANT`.
-Participant states are `PENDING`, `CONNECTED`, `DISCONNECTED`, and `REJECTED`. A
-reconnect within the 25-second heartbeat timeout reuses the same participant ID while
-its token remains valid. Once the heartbeat monitor expires the participant, its token is revoked and a
-new request is required. Pending join requests expire after 180 seconds.
+| Permission | Browse, view metadata, download | Upload new files |
+| --- | --- | --- |
+| `READ_ONLY` | Allowed while connected | Rejected |
+| `READ_WRITE` | Allowed while connected | Allowed only while host uploads are enabled |
+
+`READ_WRITE` permits only a new upload. It does not add file modification, deletion,
+rename, or directory creation operations. Host-only settings and participant
+management remain restricted to the host token. Transfer queries and cancellation
+remain scoped to the authenticated participant; the host may view/cancel any session
+transfer.
+
+For each upload, the server evaluates the conditions in this order:
+
+1. Validate the bearer token, active session, participant identity, and connected state.
+2. Require `READ_WRITE` participant permission.
+3. Require the host's global uploads setting and a selected root.
+4. Validate filename, declared size, destination path, and no-overwrite rules.
+5. Recheck participant permission and the global setting under the authorization gate
+   before creating the temporary file, before each chunk write, and before atomically
+   publishing the final file.
+
+The host's permission route updates the server-owned permission while holding the
+same gate used by upload writes and commit. On `READ_WRITE` to `READ_ONLY`, active
+uploads are cancelled, their `.part` files are deleted, and a targeted
+`participant_permission_changed` event updates the participant UI. If an event is
+missed, the next API request still uses the new server permission. A host disconnect
+or session shutdown cancels that participant's active transfers.
 
 ## HTTP API and authorization
 
-All routes use the `/api/v1` prefix. Responses use JSON and Pydantic validation.
-Validation errors omit submitted input values so a joining code is not echoed.
+Routes use the `/api/v1` prefix and structured JSON errors. Session request validation
+does not echo submitted values such as join codes. Access and transport are separate:
+all application API and event communication runs over HTTPS/WSS using the pinned
+session certificate.
 
 | Method and route | Purpose | Authorization |
 | --- | --- | --- |
-| `GET /api/v1/health` | Local server health | None |
-| `GET /api/v1/session` | Public metadata for manual connection | None |
-| `POST /api/v1/sessions/{session_id}/join-requests` | Validate code and request host approval | Joining code in request body |
-| `GET /api/v1/join-requests/{request_id}` | Poll request status and retrieve approved participant token | Request bearer token |
-| `GET /api/v1/host/snapshot` | Read requests and participants | Host bearer token |
-| `POST /api/v1/host/join-requests/{request_id}/approve` | Approve one pending request | Host bearer token |
-| `POST /api/v1/host/join-requests/{request_id}/reject` | Reject one pending request | Host bearer token |
-| `POST /api/v1/host/participants/{participant_id}/disconnect` | Revoke a connected participant | Host bearer token |
-| `POST /api/v1/host/end` | End the session | Host bearer token |
-| `GET /api/v1/files/settings` | Read shared folder name and upload availability | Connected participant token |
-| `GET /api/v1/files?path=...` | Browse one relative directory | Connected participant token |
-| `GET /api/v1/files/info?path=...` | Read file metadata | Connected participant token |
-| `GET /api/v1/files/download?path=...` | Stream one file up to 20,000,000 bytes | Connected participant token |
-| `POST /api/v1/files/upload?path=...` | Stream a new file into a relative directory | Connected participant token; uploads enabled |
-| `GET /api/v1/files/transfers` | Read this participant's transfer state | Connected participant token |
-| `POST /api/v1/files/transfers/{transfer_id}/cancel` | Cancel this participant's transfer | Connected participant token |
-| `GET /api/v1/host/files/state` | Read host-side sharing state | Host bearer token |
-| `POST /api/v1/host/files/uploads` | Enable or disable uploads | Host bearer token |
-| `GET /api/v1/host/files/transfers` | Read all session transfer states | Host bearer token |
-| `POST /api/v1/host/files/transfers/{transfer_id}/cancel` | Cancel any transfer | Host bearer token |
+| `GET /api/v1/health` | Local server health | None; HTTPS only in production session server |
+| `GET /api/v1/session` | Public session metadata and fingerprint | None; HTTPS only in production session server |
+| `POST /api/v1/sessions/{session_id}/join-requests` | Validate code and request approval | Joining code in body, HTTPS |
+| `GET /api/v1/join-requests/{request_id}` | Poll and retrieve approved token | Request bearer token, HTTPS |
+| `GET /api/v1/host/snapshot` | Read requests and participants | Host bearer token, HTTPS |
+| `POST /api/v1/host/join-requests/{request_id}/approve` | Approve request | Host bearer token, HTTPS |
+| `POST /api/v1/host/join-requests/{request_id}/reject` | Reject request | Host bearer token, HTTPS |
+| `POST /api/v1/host/participants/{participant_id}/permissions` | Change participant permission | Host bearer token, HTTPS |
+| `POST /api/v1/host/participants/{participant_id}/disconnect` | Revoke participant access | Host bearer token, HTTPS |
+| `POST /api/v1/host/end` | End session | Host bearer token, HTTPS |
+| `GET /api/v1/host/files/state` | Read host file-sharing state | Host bearer token, HTTPS |
+| `POST /api/v1/host/files/root` | Select the shared root | Host bearer token, HTTPS |
+| `POST /api/v1/host/files/stop` | Stop sharing the selected root | Host bearer token, HTTPS |
+| `POST /api/v1/host/files/uploads` | Enable or disable global uploads | Host bearer token, HTTPS |
+| `GET /api/v1/host/files/transfers` | Read all session transfer states | Host bearer token, HTTPS |
+| `POST /api/v1/host/files/transfers/{transfer_id}/cancel` | Cancel any transfer | Host bearer token, HTTPS |
+| `GET /api/v1/files/settings` | Read shared folder name and permission | Connected participant token, HTTPS |
+| `GET /api/v1/files?path=...` | Browse relative directory | Connected participant token, HTTPS |
+| `GET /api/v1/files/info?path=...` | Read file metadata | Connected participant token, HTTPS |
+| `GET /api/v1/files/download?path=...` | Download a file up to 20 MB | Connected participant token, HTTPS |
+| `POST /api/v1/files/upload?path=...` | Upload a new file | Connected token, `READ_WRITE`, global uploads enabled, HTTPS |
+| `GET /api/v1/files/transfers` | Read participant transfer state | Connected participant token, HTTPS |
+| `POST /api/v1/files/transfers/{transfer_id}/cancel` | Cancel own transfer | Connected participant token, HTTPS |
 
-Bearer tokens are sent in the HTTP `Authorization` header. The WebSocket endpoint is
-`/api/v1/sessions/{session_id}/events`. After connecting, the client must send:
+The WSS endpoint is `/api/v1/sessions/{session_id}/events`. The first message
+authenticates with a bearer token after TLS is established. Participants send a
+heartbeat every five seconds. Permission changes are sent only to the affected
+participant. File-sharing state events include only availability, global upload
+status, and the shared directory display name. Events never include joining codes,
+bearer tokens, private keys, or filesystem paths.
 
-```json
-{"type":"AUTHENTICATE","token":"<host-or-participant-token>"}
-```
+## Security boundaries and limitations
 
-Participants then send `{"type":"HEARTBEAT"}` every five seconds. The server replies
-with `{"type":"heartbeat_ack"}` and emits state events such as
-`join_request_pending`, `join_request_approved`, `join_request_rejected`,
-`participant_connected`, `participant_disconnected`, and `session_ended`. Unknown
-WebSocket message types receive a structured error response.
+- The certificate is self-signed, ephemeral, and pinned for the active connection.
+  Users must compare its fingerprint through an independent trusted channel. A value
+  obtained only from the same local network or mDNS record does not protect against a
+  network attacker who can replace both the record and certificate.
+- TLS provides transport encryption and server identity after that fingerprint check.
+  ShareSpace does not provide end-to-end encryption, public-key user identity, or
+  protection after a trusted device is compromised.
+- Private-key file mode is restrictive on POSIX. Windows uses the platform's
+  temporary-directory ACL; this development build does not set a custom Windows ACL.
+- Certificates are valid for 30 days but are removed with the session. There is no
+  persistent trust store; clients must compare a new fingerprint for a new session.
+- Session data, authentication digests, and transfer history are in memory. The app
+  disables Uvicorn access logs, logs authorization failure codes without request
+  bodies, and avoids logging credential values.
+- Files are limited to 20,000,000 bytes, transferred in 64 KiB chunks. Uploads use a
+  same-directory temporary file and atomic no-overwrite publication. Symbolic links
+  and reparse points are not followed, hidden entries are not served, and the selected
+  root is never changed by participant requests.
+- mDNS and the randomly selected local port may be blocked by firewalls, VLANs,
+  multicast settings, or client isolation. Hotspot behavior remains limited by the
+  existing platform adapters. Physical Windows/Linux network behavior requires
+  separate hardware testing.
 
-## Discovery metadata
-
-The mDNS service record contains protocol version, session ID and name, host device
-name and OS, participant count, status, and creation time. Its service address records
-carry local IPv4 addresses and the selected TCP port. It never includes a joining code,
-host token, request token, participant token, or file information. Duplicate records
-with the same session ID update one entry. A service goodbye removes an entry
-immediately; crash or packet-loss cases age out within the discovery stale timeout.
-
-Manual connection calls `GET /api/v1/session` at the entered local IPv4 address and
-port, obtains the session ID, and still requires the joining code for access. The
-desktop currently accepts private, link-local, or loopback IPv4 manual targets and
-does not accept globally routable addresses.
-
-## Security and limits
-
-- Session IDs use UUID4. Joining codes and bearer tokens use Python's `secrets` module.
-- The joining code is stored as a salted PBKDF2-HMAC-SHA256 digest in memory. Failed
-  join-code checks are rate-limited to 20 per source address per minute.
-- The session manager stores the host, request, and participant authentication digests.
-  It temporarily retains an approved participant token in that join request so the
-  requester can retrieve it by polling with its request token. Credentials remain in
-  memory only and are cleared when the session ends or a participant is revoked.
-- Only the host token can approve or reject requests, disconnect participants, or end
-  a session. The server rejects a second simultaneous WebSocket for the same
-  participant identity.
-- The server disables access logs, and validation errors do not return request bodies.
-  The app stores active state only in memory and does not write joining codes to logs.
-- File requests require an approved, currently connected participant token. Host
-  settings and transfer controls require the host token. The shared absolute path is
-  exposed only to the host UI; participant responses use relative paths and the shared
-  directory name.
-- Symbolic links and reparse points are not followed. Hidden entries are not listed or
-  served. Uploads use a same-directory temporary file, enforce declared and actual
-  sizes, and atomically create a destination only if its name is still unused.
-- Each file is limited to 20,000,000 bytes. Uploads are disabled at session start.
-  Transfer history is bounded and held only in memory. The file service does not
-  modify or delete existing shared files.
-- HTTP and WebSocket traffic are **not encrypted** in Version 0.4.0. Devices sharing
-  an untrusted local network may be able to observe traffic. TLS, stronger peer
-  identity, and broader security review are future work.
-- mDNS may be blocked by host firewalls, access-point client isolation, VLANs, or
-  multicast settings. Manual connection still depends on local TCP reachability.
-- The OS firewall may block the randomly selected server port. The UI displays the
-  port; allow the ShareSpace Python app on a trusted private network when prompted.
-- A ShareSpace-created hotspot is not assumed to permit client-to-client traffic.
-  Windows hotspot creation remains unavailable in this unpackaged development build;
-  Linux hotspot behavior remains hardware-unverified.
-- An orderly End Session sends a final event and withdraws mDNS. If the host process
-  crashes or loses power, it cannot send either message; clients detect the closed
-  transport and the discovery entry expires after its TTL/stale timeout. OS hotspot
-  cleanup after a process crash remains subject to the Version 0.2 adapter limitations.
-
-File transfers stream in 64 KiB chunks. Uploads use a raw octet stream rather than
-multipart form parsing, so no separate multipart dependency is required. The host
-selects the shared root locally; session discovery metadata never advertises the folder
-path or file contents.
+The implementation preserves the Version 0.4 file size limit and file operations.
+File deletion, rename, participant-created directories, synchronization, persistent
+history, cloud services, and end-to-end encryption are outside Version 0.5.

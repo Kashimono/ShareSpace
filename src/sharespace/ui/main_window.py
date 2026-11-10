@@ -81,7 +81,7 @@ class MainWindow(QMainWindow):
         cards.addWidget(
             self._create_action_card(
                 title="Host a session",
-                description="Create a local Wi-Fi network for nearby devices.",
+                description="Host on an existing local network or a ShareSpace hotspot.",
                 button_text="Host Session",
                 status_text="",
                 on_click=self._open_host_session,

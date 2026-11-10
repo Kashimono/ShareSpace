@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -13,6 +15,11 @@ import websockets
 
 from sharespace.core.models import HostSnapshot, JoinRequestCreated, JoinRequestPoll, PublicSession
 from sharespace.networking.session_server import API_PREFIX
+from sharespace.networking.tls_security import (
+    TLSConnectionSecurity,
+    TLSVerificationError,
+    format_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,15 +31,36 @@ class SessionClientError(RuntimeError):
 class SessionClient:
     """Make local HTTP calls and hold an event WebSocket without Qt dependencies."""
 
-    def __init__(self, host: str, port: int, *, timeout_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        certificate_fingerprint: str,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> None:
         self.host = host
         self.port = port
-        self.base_url = f"http://{host}:{port}{API_PREFIX}"
+        self.base_url = f"https://{host}:{port}{API_PREFIX}"
         self.timeout_seconds = timeout_seconds
+        self.security = TLSConnectionSecurity(host, port, certificate_fingerprint, timeout_seconds=timeout_seconds)
+        self._http_client: httpx.Client | None = None
+        self._http_client_lock = threading.Lock()
+
+    @property
+    def tls_version(self) -> str | None:
+        return self.security.tls_version
+
+    @property
+    def certificate_verified(self) -> bool:
+        return self.security.verified
 
     async def get_public_session(self) -> PublicSession:
         data = await self._request("GET", "/session")
-        return PublicSession.model_validate(data)
+        session = PublicSession.model_validate(data)
+        if session.certificate_fingerprint != self.security.expected_fingerprint:
+            raise SessionClientError("The host certificate changed. Verify the new fingerprint before continuing.")
+        return session
 
     async def request_join(
         self,
@@ -72,6 +100,41 @@ class SessionClient:
     async def end_session(self, host_token: str) -> None:
         await self._request("POST", "/host/end", token=host_token)
 
+    async def set_participant_permission(
+        self,
+        participant_id: str,
+        permission: str,
+        host_token: str,
+    ) -> None:
+        await self._request(
+            "POST",
+            f"/host/participants/{participant_id}/permissions",
+            token=host_token,
+            json={"permission": permission},
+        )
+
+    async def select_shared_root(self, path: str, host_token: str) -> None:
+        await self._request("POST", "/host/files/root", token=host_token, json={"path": path})
+
+    async def stop_sharing(self, host_token: str) -> None:
+        await self._request("POST", "/host/files/stop", token=host_token)
+
+    async def set_uploads_enabled(self, enabled: bool, host_token: str) -> None:
+        await self._request(
+            "POST", "/host/files/uploads", token=host_token, json={"enabled": enabled}
+        )
+
+    async def cancel_host_transfer(self, transfer_id: str, host_token: str) -> None:
+        await self._request(
+            "POST", f"/host/files/transfers/{transfer_id}/cancel", token=host_token
+        )
+
+    def close(self) -> None:
+        with self._http_client_lock:
+            client, self._http_client = self._http_client, None
+        if client is not None:
+            client.close()
+
     async def events(
         self,
         *,
@@ -83,14 +146,16 @@ class SessionClient:
         on_connection_state: Callable[[str], None] | None = None,
     ) -> None:
         """Reconnect and consume events; participant clients send heartbeats."""
-        uri = f"ws://{self.host}:{self.port}{API_PREFIX}/sessions/{session_id}/events"
+        uri = f"wss://{self.host}:{self.port}{API_PREFIX}/sessions/{session_id}/events"
         retry_delay = 1.0
         while not stop_event.is_set():
             try:
+                await self.security.verify_peer()
                 if on_connection_state:
                     on_connection_state("connecting")
                 async with websockets.connect(
                     uri,
+                    ssl=self.security.ssl_context,
                     ping_interval=20,
                     open_timeout=self.timeout_seconds,
                     close_timeout=2,
@@ -119,12 +184,36 @@ class SessionClient:
                             on_event(data)
                             if data.get("type") == "session_ended":
                                 return
+            except TLSVerificationError as error:
+                on_event({"type": "session_security_error", "detail": str(error)})
+                if on_connection_state:
+                    on_connection_state("security_error")
+                return
+            except ssl.SSLCertVerificationError:
+                replacement = await self.security.inspect_changed_fingerprint()
+                if replacement is not None:
+                    on_event({
+                        "type": "session_security_error",
+                        "detail": "The host certificate changed. Verify it again through a trusted channel.",
+                        "presented_fingerprint": replacement,
+                    })
+                    if on_connection_state:
+                        on_connection_state("security_error")
+                    return
+                logger.warning("The verified session certificate failed TLS validation.")
+                on_event({
+                    "type": "session_security_error",
+                    "detail": "The host certificate failed TLS validation.",
+                })
+                if on_connection_state:
+                    on_connection_state("security_error")
+                return
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 if on_connection_state:
                     on_connection_state("disconnected")
-                logger.debug("Session event connection interrupted: %s", error)
+                logger.debug("Session event connection interrupted (%s).", type(error).__name__)
                 if stop_event.is_set():
                     break
                 await asyncio.sleep(retry_delay)
@@ -142,14 +231,26 @@ class SessionClient:
     ) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.request(
-                    method,
-                    f"{self.base_url}{path}",
-                    headers=headers,
-                    json=json,
-                )
+            await self.security.verify_peer()
+            client = self._get_http_client()
+            response = await asyncio.to_thread(
+                client.request,
+                method,
+                f"{self.base_url}{path}",
+                headers=headers,
+                json=json,
+            )
+        except TLSVerificationError as error:
+            logger.warning("Session HTTPS certificate validation failed.")
+            raise SessionClientError(str(error)) from error
         except httpx.HTTPError as error:
+            replacement = await self.security.inspect_changed_fingerprint()
+            if replacement is not None:
+                logger.warning("Session HTTPS certificate changed during the active session.")
+                raise SessionClientError(
+                    "The host certificate changed. Presented fingerprint: "
+                    f"{format_fingerprint(replacement)}"
+                ) from error
             raise SessionClientError("Could not reach the ShareSpace session host.") from error
         try:
             data = response.json()
@@ -167,3 +268,13 @@ class SessionClient:
         if not isinstance(data, dict):
             raise SessionClientError("The session host returned an invalid response.")
         return data
+
+    def _get_http_client(self) -> httpx.Client:
+        with self._http_client_lock:
+            if self._http_client is None:
+                self._http_client = httpx.Client(
+                    verify=self.security.ssl_context,
+                    timeout=self.timeout_seconds,
+                    trust_env=False,
+                )
+            return self._http_client

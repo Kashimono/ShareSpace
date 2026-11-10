@@ -19,7 +19,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from sharespace.core.models import DirectoryListing, FileItem, FileItemType, SharedDirectoryState, TransferStatus
+from sharespace.core.models import (
+    DirectoryListing,
+    FileItem,
+    FileItemType,
+    PermissionLevel,
+    SharedDirectoryState,
+    TransferStatus,
+)
 from sharespace.networking.file_client import FileClient, FileClientError
 from sharespace.ui.session_workers import SessionWorker
 
@@ -27,7 +34,13 @@ from sharespace.ui.session_workers import SessionWorker
 class FileBrowserDialog(QDialog):
     """Browse a session's explicitly shared root and move files in either direction."""
 
-    def __init__(self, client: FileClient, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        client: FileClient,
+        parent: QWidget | None = None,
+        *,
+        permission: PermissionLevel = PermissionLevel.READ_ONLY,
+    ) -> None:
         super().__init__(parent)
         self.client = client
         self._thread_pool = QThreadPool(self)
@@ -35,6 +48,8 @@ class FileBrowserDialog(QDialog):
         self._path = ""
         self._listing: DirectoryListing | None = None
         self._state: SharedDirectoryState | None = None
+        self._permission = permission
+        self._session_unavailable: str | None = None
         self._busy = False
         self._operation_id: str | None = None
         self._cancel_events: dict[str, threading.Event] = {}
@@ -99,7 +114,7 @@ class FileBrowserDialog(QDialog):
         QTimer.singleShot(0, self._load_directory)
 
     def _load_directory(self) -> None:
-        if self._busy:
+        if self._busy or self._session_unavailable:
             return
         self._busy = True
         self._status.setText("Loading shared files…")
@@ -118,6 +133,8 @@ class FileBrowserDialog(QDialog):
     def _directory_loaded(self, result: object) -> None:
         self._busy = False
         self._state, self._listing = result
+        if self._state.permission is not None:
+            self._permission = self._state.permission
         listing: DirectoryListing = self._listing
         self._path = listing.directory_path
         self._path_label.setText(f"/{self._path}" if self._path else "/")
@@ -138,19 +155,99 @@ class FileBrowserDialog(QDialog):
                 row.setForeground(Qt.GlobalColor.gray)
             self._items.addItem(row)
         if not self._state.available:
-            self._status.setText("The host is not currently sharing a folder.")
+            self._status.setText(
+                f"Permission: {self._permission.value}. The host is not currently sharing a folder."
+            )
+        elif self._permission is PermissionLevel.READ_ONLY:
+            self._status.setText(
+                f"Browsing {listing.shared_directory_name}. This device has READ_ONLY permission."
+            )
         elif self._state.uploads_enabled:
-            self._status.setText(f"Browsing {listing.shared_directory_name}. Uploads are enabled.")
+            self._status.setText(
+                f"Browsing {listing.shared_directory_name}. Permission: READ_WRITE. Uploads are enabled."
+            )
         else:
-            self._status.setText(f"Browsing {listing.shared_directory_name}. Downloads are available; uploads are disabled.")
+            self._status.setText(
+                f"Browsing {listing.shared_directory_name}. Permission: READ_WRITE. "
+                "The host has uploads disabled."
+            )
         self._update_actions()
+
+    def apply_permission(self, permission: PermissionLevel) -> None:
+        """Apply a permission change received on the live session connection."""
+        self._permission = permission
+        self._update_status_for_permission()
+        self._update_actions()
+
+    def set_session_unavailable(self, detail: str) -> None:
+        """Disable file actions after session access or TLS trust is lost."""
+        self._session_unavailable = detail
+        for cancel_event in self._cancel_events.values():
+            cancel_event.set()
+        self._status.setText(detail)
+        self._update_actions()
+
+    def apply_sharing_state(
+        self, *, available: bool, uploads_enabled: bool, directory_name: str | None
+    ) -> None:
+        """Apply host file-sharing settings delivered through the session event stream."""
+        previous_name = self._state.directory_name if self._state else None
+        if self._state is not None:
+            self._state = self._state.model_copy(update={
+                "available": available,
+                "shared": available,
+                "uploads_enabled": uploads_enabled and available,
+                "directory_name": directory_name,
+            })
+        if not available:
+            self._path = ""
+            self._listing = None
+            self._items.clear()
+            self._status.setText(
+                f"Permission: {self._permission.value}. The host is not currently sharing a folder."
+            )
+        elif directory_name != previous_name:
+            self._path = ""
+            self._load_directory()
+        else:
+            self._update_status_for_permission()
+        self._update_actions()
+
+    def _update_status_for_permission(self) -> None:
+        if not self._state:
+            return
+        if not self._state.available:
+            self._status.setText(
+                f"Permission: {self._permission.value}. The host is not currently sharing a folder."
+            )
+            return
+        if not self._listing:
+            return
+        if self._permission is PermissionLevel.READ_ONLY:
+            self._status.setText(
+                f"Browsing {self._listing.shared_directory_name}. This device has READ_ONLY permission."
+            )
+        elif self._state.uploads_enabled:
+            self._status.setText(
+                f"Browsing {self._listing.shared_directory_name}. Permission: READ_WRITE. "
+                "Uploads are enabled."
+            )
+        else:
+            self._status.setText(
+                f"Browsing {self._listing.shared_directory_name}. Permission: READ_WRITE. "
+                "The host has uploads disabled."
+            )
 
     def _operation_failed(self, message: str) -> None:
         self._busy = False
         if self._operation_id:
             self._cancel_events.pop(self._operation_id, None)
         self._operation_id = None
-        self._status.setText(f"File operation failed: {message}")
+        if "certificate changed" in message.casefold() or "certificate validation" in message.casefold():
+            self._session_unavailable = message
+            self._status.setText(message)
+        else:
+            self._status.setText(f"File operation failed: {message}")
         self._update_actions()
 
     def _go_up(self) -> None:
@@ -168,6 +265,8 @@ class FileBrowserDialog(QDialog):
             self._download_selected()
 
     def _download_selected(self) -> None:
+        if self._session_unavailable:
+            return
         row = self._items.currentItem()
         if row is None:
             return
@@ -186,6 +285,11 @@ class FileBrowserDialog(QDialog):
         )
 
     def _choose_upload(self) -> None:
+        if self._session_unavailable:
+            return
+        if self._permission is not PermissionLevel.READ_WRITE:
+            self._status.setText("This device has READ_ONLY permission. Ask the host for upload access.")
+            return
         if not self._state or not self._state.uploads_enabled:
             self._status.setText("The host has uploads disabled.")
             return
@@ -282,13 +386,22 @@ class FileBrowserDialog(QDialog):
         selected = self._items.currentItem()
         item = selected.data(Qt.ItemDataRole.UserRole) if selected else None
         self._download_button.setEnabled(
-            not self._busy and item is not None and item.item_type is FileItemType.FILE and item.accessible
+            not self._busy and self._session_unavailable is None and item is not None
+            and self._state is not None and self._state.available
+            and item.item_type is FileItemType.FILE and item.accessible
         )
         self._upload_button.setEnabled(
-            not self._busy and self._state is not None and self._state.uploads_enabled
+            not self._busy
+            and self._session_unavailable is None
+            and self._permission is PermissionLevel.READ_WRITE
+            and self._state is not None
+            and self._state.uploads_enabled
         )
-        self._refresh_button.setEnabled(not self._busy)
-        self._back_button.setEnabled(not self._busy and self._listing is not None and self._listing.parent_path is not None)
+        self._refresh_button.setEnabled(not self._busy and self._session_unavailable is None)
+        self._back_button.setEnabled(
+            not self._busy and self._session_unavailable is None
+            and self._listing is not None and self._listing.parent_path is not None
+        )
         transfer = self._transfers.currentItem()
         self._cancel_button.setEnabled(
             transfer is not None and bool(transfer.data(Qt.ItemDataRole.UserRole + 1))
@@ -300,4 +413,5 @@ class FileBrowserDialog(QDialog):
             event.ignore()
             return
         self._transfer_timer.stop()
+        self.client.close()
         super().closeEvent(event)

@@ -6,6 +6,7 @@ from sharespace.core.models import (
     JoinRequestStatus,
     ParticipantRole,
     ParticipantStatus,
+    PermissionLevel,
     SessionStatus,
 )
 from sharespace.core.session_manager import (
@@ -97,6 +98,29 @@ def test_approval_registers_participant_and_host_can_disconnect_them():
     assert participant.status is ParticipantStatus.CONNECTED
     assert participant.role is ParticipantRole.PARTICIPANT
     assert manager.get_public_session().participant_count == 2
+
+
+def test_approved_participants_default_read_only_and_only_host_can_change_permission():
+    manager, session, credentials = create_session()
+    request_id, request_token, _ = request_join(manager, session, credentials)
+    manager.approve_request(request_id, credentials.host_token)
+    _, participant_token = manager.poll_join_request(request_id, request_token)
+    participant = manager.authenticate_participant(participant_token)
+
+    assert participant.permission is PermissionLevel.READ_ONLY
+    with pytest.raises(PermissionDenied):
+        manager.set_participant_permission(
+            participant.participant_id, PermissionLevel.READ_WRITE, participant_token
+        )
+
+    changed = manager.set_participant_permission(
+        participant.participant_id, PermissionLevel.READ_WRITE, credentials.host_token
+    )
+    assert changed.permission is PermissionLevel.READ_WRITE
+    with pytest.raises(PermissionDenied):
+        manager.set_participant_permission(
+            participant.participant_id, PermissionLevel.READ_ONLY, "invalid-host-token"
+        )
 
     disconnected = manager.disconnect_participant(participant.participant_id, credentials.host_token)
     assert disconnected.status is ParticipantStatus.DISCONNECTED

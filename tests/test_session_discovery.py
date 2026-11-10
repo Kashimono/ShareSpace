@@ -14,7 +14,8 @@ class FakeServiceInfo:
             b"participant_count": str(count).encode(),
             b"status": b"active",
             b"created_at": b"2026-01-01T00:00:00+00:00",
-            b"protocol": b"1",
+            b"protocol": b"2",
+            b"certificate_fingerprint": b"a" * 64,
         }
 
     def parsed_addresses(self):

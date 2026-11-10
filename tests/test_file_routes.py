@@ -118,6 +118,12 @@ def test_upload_default_off_enable_size_path_and_collision_protection(tmp_path):
         setting = client.get("/api/v1/files/settings", headers=participant)
         assert setting.status_code == 200
         assert setting.json()["uploads_enabled"] is False
+        assert setting.json()["permission"] == "READ_ONLY"
+        participant_id = next(
+            item.participant_id
+            for item in manager.host_snapshot(credentials.host_token)[2]
+            if item.role.value == "PARTICIPANT"
+        )
 
         encoded_filename = base64.urlsafe_b64encode("résumé.txt".encode()).decode().rstrip("=")
         payload = "new local file".encode()
@@ -136,6 +142,23 @@ def test_upload_default_off_enable_size_path_and_collision_protection(tmp_path):
         enabled = client.post("/api/v1/host/files/uploads", headers=host, json={"enabled": True})
         assert enabled.status_code == 200
         assert enabled.json()["uploads_enabled"] is True
+        read_only_upload = client.post(
+            "/api/v1/files/upload", params={"path": "drop"}, headers=upload_headers, content=payload
+        )
+        assert read_only_upload.status_code == 403
+        forbidden_permission_change = client.post(
+            f"/api/v1/host/participants/{participant_id}/permissions",
+            headers=participant,
+            json={"permission": "READ_WRITE"},
+        )
+        assert forbidden_permission_change.status_code == 403
+        granted = client.post(
+            f"/api/v1/host/participants/{participant_id}/permissions",
+            headers=host,
+            json={"permission": "READ_WRITE"},
+        )
+        assert granted.status_code == 200
+        assert granted.json()["permission"] == "READ_WRITE"
         uploaded = client.post(
             "/api/v1/files/upload", params={"path": "drop"}, headers=upload_headers, content=payload
         )
@@ -146,10 +169,25 @@ def test_upload_default_off_enable_size_path_and_collision_protection(tmp_path):
             "/api/v1/files/upload", params={"path": "drop"}, headers=upload_headers, content=payload
         )
         assert collision.status_code == 409
+        revoked = client.post(
+            f"/api/v1/host/participants/{participant_id}/permissions",
+            headers=host,
+            json={"permission": "READ_ONLY"},
+        )
+        assert revoked.status_code == 200
+        rejected_after_revoke = client.post(
+            "/api/v1/files/upload", params={"path": "drop"}, headers=upload_headers, content=payload
+        )
+        assert rejected_after_revoke.status_code == 403
         assert (tmp_path / "drop" / "résumé.txt").read_bytes() == payload
 
         traversal = client.get("/api/v1/files", params={"path": "../"}, headers=participant)
         assert traversal.status_code == 403
+        client.post(
+            f"/api/v1/host/participants/{participant_id}/permissions",
+            headers=host,
+            json={"permission": "READ_WRITE"},
+        )
         oversized = client.post(
             "/api/v1/files/upload",
             headers={

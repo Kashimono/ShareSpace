@@ -1,78 +1,100 @@
 # ShareSpace
 
 ShareSpace is an offline-first local file-sharing application for Windows and Linux.
-Version 0.4.0 adds authenticated browsing, downloads, and optional uploads for a
-host-selected directory.
+Version 0.5.0 adds per-participant upload permissions and TLS-protected sessions.
+Runtime file sharing works over the local network and does not need a cloud service,
+public certificate authority, or internet connection.
 
 ## Development setup
 
-Use Python 3.11 or newer. Install the application and its local runtime dependencies:
+Use Python 3.11 or newer. Install the project and development dependencies:
 
     python -m venv .venv
     .venv\Scripts\Activate.ps1
     python -m pip install -e ".[dev]"
     python -m sharespace
 
-On Linux, activate the environment with `source .venv/bin/activate` and use the same
-install and launch commands. ShareSpace has no cloud service or Internet requirement
-at runtime.
+On Linux, activate with `source .venv/bin/activate`, then run the same install and
+launch commands. The `cryptography` dependency creates session certificates locally.
 
-## Create or join a session
+## Host and join a session
 
-From **Host Session**, choose **Host on this network** to use an existing local Wi-Fi
-or Ethernet network. To use Version 0.2 hotspot support, create the hotspot first and
-choose **Host using this hotspot**. The session server binds to all local IPv4
-interfaces on an operating-system-assigned port. ShareSpace displays the selected
-host IP, port, session ID, and joining code.
+From **Host Session**, choose **Host on this network** to use an existing Wi-Fi or
+Ethernet network. Version 0.2 hotspot support is available through **Host using this
+hotspot** after creating the hotspot. The session server binds to local IPv4
+interfaces on an operating-system-assigned port and displays the address, joining
+code, and SHA-256 certificate fingerprint.
 
-The joining code is an authentication credential. It is not an address. Hosts advertise
-public session metadata with Zeroconf/mDNS; the advertisement never contains the
-joining code, host token, participant token, or file information. Participants can
-select a discovered session, enter its code, and wait for host approval. If multicast
-discovery is blocked, enter the host's local IPv4 address and displayed port manually.
+Participants can select a discovered session or enter the host's local IPv4 address
+and port. Before a join code or bearer credential is sent, the participant must
+compare the fingerprint with the host using a trusted channel, such as reading it
+directly from the host screen or confirming it with a known contact. The fingerprint
+in mDNS discovery is convenient for display, but is not an independent trust check.
+ShareSpace first inspects the certificate without sending application data, checks the
+fingerprint, and then uses strict certificate and host-address verification for all
+HTTPS and WSS communication.
 
-The host can approve or reject requests, view participant roles and connection states,
-disconnect a connected participant, and end the session. WebSocket heartbeats detect
-stale connections. Session state and credentials exist only in process memory.
+The joining code is an authentication credential, not an address. Discovery records
+contain public session metadata only; they never contain joining codes, host tokens,
+participant tokens, or file information. When multicast discovery is unavailable,
+manual local address and port entry is supported.
 
-## Share files in a session
+## Participant permissions and file sharing
 
-After starting a session, the host chooses one directory from the session dashboard.
-Participants can browse and download its files after the host approves them and their
-session connection is active. Uploads are disabled by default; the host can enable or
-disable them at any time. Each file is limited to 20,000,000 bytes (20 MB decimal).
-Uploads create new files only and fail if the destination name already exists.
+Approved participants start with **READ_ONLY** permission. They can browse the
+host-selected directory, view file information, and download permitted files. The
+host can grant **READ_WRITE** to allow a participant to upload new files. This does
+not allow overwriting, modifying, renaming, deleting, or creating directories.
 
-Paths shown to participants are relative to the shared directory. Hidden files and
-symbolic links are excluded, traversal outside the selected directory is rejected, and
-the selected root stays on the host. The file service does not create folders, delete
-files, synchronize changes, or preserve transfer history after a session ends.
+Uploads require both the participant's **READ_WRITE** permission and the host's
+global upload switch to be enabled. Either condition being false rejects an upload.
+Revoking READ_WRITE cancels active uploads and removes incomplete temporary files;
+the server checks authorization while processing each upload chunk and before
+publishing the completed file. The global switch remains available as an emergency
+disable for every participant.
 
-## Dependencies and local transport
+Each file is limited to 20,000,000 bytes (20 MB decimal). Uploads create new files
+only and fail if the destination name already exists. Paths shown to participants are
+relative to the shared directory. Hidden files and symbolic links are excluded, and
+traversal outside the selected directory is rejected. Transfer history is held only
+in memory and cleared with the session.
 
-Runtime dependencies are PySide6, FastAPI, Uvicorn, HTTPX, WebSockets, Zeroconf,
-psutil, and Pydantic. Network traffic stays on the local network. Session and file
-requests use HTTP, real-time events use WebSockets, and file contents stream in bounded
-chunks. Traffic is not encrypted; use trusted local networks. TLS and stronger identity
-work are later security milestones.
+## TLS and certificate trust
 
-Windows hotspot control retains the Version 0.2 limitation: the current unpackaged
-development install lacks the required `wiFiControl` package capability, and the
-Windows tethering API also needs a connection profile. Linux hotspot tests remain
-mocked and do not verify a real adapter. Hosting over an existing local network is
-available independently of hotspot creation.
+Each host session creates an ephemeral self-signed RSA certificate. Its subject
+alternative names include the local IP addresses used by the server, loopback IPs,
+and localhost. The host's SHA-256 fingerprint is shown in the host interface and can
+be copied. The private key is stored in a temporary session directory and removed
+when the server stops. On POSIX systems the key and directory use mode `0600` and
+`0700`; Windows uses the temporary directory's inherited access-control list.
 
-## Automated tests
+HTTP uses HTTPS and event connections use WSS, with TLS 1.2 as the minimum and newer
+protocols negotiated when available. A client pins the self-signed certificate only
+after the fingerprint comparison, then validates the certificate, its validity
+period, and the requested IP address for every encrypted connection. ShareSpace does
+not fall back to plaintext HTTP or WebSockets. Transport encryption protects traffic
+on the local network; this milestone does not implement end-to-end encryption.
 
-Run the suite with:
+## Platform notes
+
+The same Python TLS, HTTP, WebSocket, and permission logic is shared by Windows and
+Linux. Hotspot control remains behind the existing platform-specific adapters. The
+current unpackaged Windows development install lacks the required `wiFiControl`
+package capability, and the Windows tethering API also needs a connection profile.
+Linux hotspot tests remain mocked. Hosting on an existing local network does not
+depend on hotspot creation.
+
+## Tests and documentation
+
+Run the automated suite with:
 
     python -m pytest -q
 
-The suite exercises session state and HTTP/WebSocket routes, mDNS parsing, file path
-confinement, authentication, transfer limits and cancellation, and loopback file
-transfers through the embedded server. It does not verify two physical devices,
-multicast reachability, firewall behavior, or hotspot connectivity.
+Tests cover permissions, API authorization, upload cancellation and cleanup,
+certificate generation, fingerprint pinning, HTTPS/WSS loopback connections, and
+credential revocation. Loopback tests do not establish physical Windows/Linux
+connectivity, multicast reachability, firewall behavior, or hotspot support.
 
 See [docs/architecture.md](docs/architecture.md) for module boundaries and API
-messages, and [docs/networking-tests.md](docs/networking-tests.md) for test results,
-limitations, and two-computer test steps.
+authorization, and [docs/networking-tests.md](docs/networking-tests.md) for coverage,
+limitations, and two-computer testing instructions.

@@ -1,142 +1,116 @@
-# Version 0.4.0 session and file-sharing tests
+# Version 0.5.0 networking and security tests
 
-## Automated tests
+## Run automated tests
 
-Install dependencies and run the project suite:
+Install the project with development dependencies and run:
 
     python -m pip install -e ".[dev]"
     python -m pytest -q
 
-Session tests cover:
+Current verification in the development workspace: **56 passed, 2 skipped**. The
+suite prints one existing Starlette warning that using HTTPX with its `TestClient` is
+deprecated. The in-process `TestClient` cases exercise API and authorization logic;
+they do not prove transport encryption. Embedded Uvicorn integration tests exercise
+HTTPS/WSS on loopback with production-style ephemeral certificates.
 
-- Session and credential generation, unique IDs, code hashing, and host identity.
-- Join-code validation, duplicate-request idempotence, approval and rejection.
-- Participant registration, role/state reporting, heartbeat updates, reconnects, and
-  stale participant expiry.
-- Host authorization, participant disconnect, and session teardown.
-- FastAPI metadata, validation, request polling, and host endpoints.
-- WebSocket authentication, heartbeat acknowledgement, state events, and host
-  termination notification.
-- Fake Zeroconf records, duplicate session advertisements, stale entry removal, and
-  metadata secrecy.
-- Windows-host/Linux-participant and Linux-host/Windows-participant protocol metadata.
+## Automated coverage
 
-File-sharing tests cover:
+- Session tests: credential generation and hashing, join-code validation and rate
+  limits, approval, participant status, host-only control, heartbeat expiry, token
+  revocation, and default `READ_ONLY` permissions.
+- Permission/API tests: read-only browsing and download, read-only upload rejection,
+  host-only permission updates, `READ_WRITE` upload success, global upload disable,
+  revocation, transfer ownership, and structured errors.
+- Transfer/file tests: directory confinement, hidden files, symlink and reparse-point
+  handling, filename validation, 20,000,000-byte limit, no-overwrite behavior,
+  chunked transfers, cancellation, revocation during an active upload, and `.part`
+  cleanup.
+- TLS tests: ephemeral certificate and SHA-256 fingerprint generation, local IP SANs,
+  restrictive POSIX temporary permissions, and certificate cleanup.
+- Loopback server tests: TLS-enabled Uvicorn startup, verified HTTPS, authenticated
+  WSS and heartbeat, targeted permission events, mismatched fingerprint rejection,
+  changed-certificate inspection, plaintext HTTP rejection, participant credential
+  revocation, and certificate cleanup after shutdown.
+- Discovery tests use fake Zeroconf records. Cross-platform metadata and hotspot
+  adapters use unit tests and mocks; no real Wi-Fi adapter is exercised.
 
-- Explicit directory selection, relative paths, hidden entries, symbolic links, and
-  traversal rejection.
-- Connected-participant authentication and host-only upload settings.
-- Browse metadata, Unicode filenames, bounded downloads, default-disabled uploads,
-  upload completion, size checks, and no-overwrite behavior.
-- Transfer byte accounting, cancellation ownership, interrupted-upload cleanup, and
-  temporary-file removal, including cancellation while an upload request body stalls.
+## Test with two physical computers
 
-The API suite uses FastAPI's in-process TestClient; the discovery suite uses fake mDNS
-records. Two loopback tests bind the embedded Uvicorn server: one exercises HTTP
-approval, a real WebSocket heartbeat, host disconnect, and teardown; the other runs
-FileClient browse, download, and upload operations. The tests do not send multicast on
-a real interface, traverse a firewall, or verify physical client connections.
+This manual test uses an existing Wi-Fi or Ethernet LAN first. Confirm that local
+devices can reach each other; internet access is not required. Firewalls, VLANs, and
+wireless client isolation may block the connection.
 
-## Two-computer test over an existing local network
+1. Install Python 3.11+ and ShareSpace on both computers with the README setup. Use a
+Windows 10/11 and Linux pair for mixed-platform checks.
+2. Start **Host Session** on one computer and choose **Host on this network**. Record
+the host address and port, joining code, and the complete SHA-256 certificate
+fingerprint shown by ShareSpace.
+3. Give the participant the address, joining code, and fingerprint through a trusted
+comparison channel. For example, read the fingerprint from the host display in
+person or confirm it by voice with a known contact. Do not rely only on the mDNS
+advertisement or another value sent over the same local network.
+4. On the participant, select the discovered session or enter its local IPv4 address
+and port manually. Compare/enter the fingerprint, confirm that it was checked through
+the trusted channel, and verify the host before entering the join code. Confirm that
+the UI reports a verified TLS connection. If the fingerprint differs, stop and do not
+send the joining code.
+5. Enter the joining code and request access. Approve the participant on the host.
+The participant should connect with `READ_ONLY` permission. Confirm it can browse,
+view file metadata, and download a file but cannot upload.
+6. Select a test folder on the host and enable global uploads. Confirm that the
+participant still cannot upload while `READ_ONLY`. Grant that participant
+`READ_WRITE`; confirm the UI updates immediately and a new file uploads. Confirm a
+duplicate filename is rejected without replacing the existing host file.
+7. Start a larger test upload and revoke `READ_WRITE` while it is active. Confirm the
+transfer stops, no destination file appears, and no temporary `.part` file remains.
+Then grant `READ_WRITE` again, disable global uploads, and confirm uploads are still
+rejected. This verifies that both permission conditions are required.
+8. Disconnect the participant from the host. Confirm its file requests fail and its
+active transfers stop. Join again if desired, then end the host session. Confirm the
+server stops and its fingerprint changes in a new session.
+9. Repeat with Windows hosting and Linux joining, then Linux hosting and Windows
+joining. Record firewall and adapter behavior separately from the automated results.
 
-This is the recommended first hardware test because it does not rely on independent
-hotspot creation. Both computers must share a local network that permits client-to-host
-traffic. Internet access is not needed, but a router or access point may still isolate
-wireless clients from one another.
+If discovery fails but local TCP is permitted, use manual address and port entry. If
+TLS verification fails, compare the newly presented fingerprint with the host through
+the trusted channel. Do not accept it solely because the device appears in discovery.
 
-1. On both computers, install and launch ShareSpace using the development setup in the
-   README. Use a Windows 10/11 and Linux pair for mixed-platform testing.
-2. Connect both computers to the same local Wi-Fi or wired LAN. For an offline test,
-   use a local network with its Internet uplink disabled while leaving local device
-   communication enabled.
-3. On the host, choose **Host Session**, enter a session name, and select **Host on
-   this network**. The app chooses a local IPv4 address and random port and displays
-   `IP:port`, session ID, and joining code.
-4. If Windows Firewall asks, allow the ShareSpace Python application on the trusted
-   private network. Firewall policy may require an administrator to allow inbound TCP
-   to the displayed port. The port is selected dynamically for each session.
-5. On the participant, choose **Join Session**. Select the discovered session. If no
-   session appears after refresh, enter the host IP and port manually. Enter the
-   joining code supplied by the host and request access.
-6. On the host, confirm the device and OS shown in Pending join requests, then approve
-   the request. Confirm the participant reports Connected and the host count changes.
-7. On the host, choose **Select shared folder** and select a test directory. On the
-   participant, choose **Browse Shared Files**, open a subfolder, and download a file
-   no larger than 20 MB. Confirm the saved bytes match the host copy.
-8. Enable uploads on the host. Upload a new file from the participant and confirm it
-   appears in the selected host directory. Try the same filename again and confirm
-   ShareSpace reports a conflict without replacing the existing file. Disable uploads
-   and confirm a further upload is rejected.
-9. On the host, select the participant and choose **Disconnect participant**. Confirm
-   the participant sees the disconnection. Start a fresh join request to test approval
-   again.
-10. To test approval again after a host disconnect, close and reopen the participant's
-   Join Session window to start a fresh join request. Then end the session from the host.
-   Confirm the participant sees the host-ended event, the server closes, and the session
-   disappears from discovery after the service withdrawal is received.
-11. Repeat with Windows hosting and Linux joining, then Linux hosting and Windows
-   joining. Windows hotspot capability is not part of this LAN test.
-
-If mDNS is unavailable but the local network permits TCP, manual IP and port connection
-should still work. If neither device can reach the host, check firewall rules, client
-isolation, VLAN/subnet routing, selected host interface, and whether the host IP is
-reachable from the participant.
-
-## ShareSpace-created hotspot test
+## Hotspot checks
 
 ### Linux
 
-Linux hotspot creation still uses the Version 0.2 NetworkManager adapter. On a Linux
-device with a radio/driver that reports AP mode support:
-
-1. Open Host Session, select a wireless adapter, check compatibility, configure the
-   SSID and password, and create the hotspot.
-2. After the OS reports the hotspot active, choose **Host using this hotspot**.
-3. Join from a second device and complete the same approval and teardown steps above.
-4. Repeat with the Internet uplink disconnected. Verify host/participant local
-   connectivity, and confirm the hotspot and session stop cleanly.
-
-This is a manual test procedure only. Linux hotspot creation, client association,
-client isolation behavior, and session traffic have not been hardware-verified in this
-milestone.
+The existing Version 0.2 NetworkManager adapter can be checked on a Linux computer
+with a compatible radio/driver. Create the hotspot, host a session through **Host
+using this hotspot**, and repeat the permission and transfer procedure above. Repeat
+with internet uplink disconnected. Current Linux hotspot tests are mocked; radio
+support, client association, and client-to-client communication have not been
+verified on hardware.
 
 ### Windows
 
-The current unpackaged Windows development install lacks the required `wiFiControl`
-package identity/capability, so the existing Version 0.2 adapter reports hotspot
-control unavailable. The session fallback can still be tested on an existing local
-network. Do not treat hosting on the current LAN as proof that Windows hotspot creation
-works. A future packaged build must declare the capability, then test Windows 10 and
-Windows 11 separately.
+The current unpackaged development installation lacks the required `wiFiControl`
+package identity/capability, and the Windows tethering API also needs a connection
+profile. The existing adapter reports hotspot control unavailable in this build.
+Hosting over an existing Wi-Fi or wired LAN remains available and is independent of
+this limitation.
 
-## Verification record
+## Verification record and limits
 
-| Verification type | Status |
+| Verification | Result |
 | --- | --- |
-| Automated suite | 53 passed, 2 skipped; one warning from the current Starlette TestClient/httpx combination |
-| File API and client integration | In-process auth, path, limit, upload/download, and cancellation tests; embedded Uvicorn file transfers verified |
-| Discovery logic and advertisement metadata | Fake Zeroconf records only; no multicast hardware check |
-| Real local server and client protocol | Loopback HTTP/WebSocket lifecycle and FileClient browse/upload/download verified |
-| Existing Wi-Fi/LAN with two computers | Not hardware-verified in this milestone |
-| ShareSpace-created Linux hotspot | Mocked tests only; no radio or client connection verified |
-| ShareSpace-created Windows hotspot | Unavailable in this unpackaged build because of the existing `wiFiControl` capability limitation |
-| Cross-platform Windows/Linux physical connections | Not verified |
-| Encryption | Not implemented; local HTTP and WebSocket traffic is unencrypted |
+| Automated suite | 56 passed, 2 skipped; one Starlette/HTTPX deprecation warning |
+| HTTP API and permission rules | In-process TestClient tests; application authorization verified, transport not covered by these cases |
+| TLS certificate/IP SAN and cleanup | Automated certificate tests |
+| HTTPS and WSS | Embedded Uvicorn loopback tests with ephemeral session certificates |
+| Fingerprint mismatch/change handling | Loopback tests reject a wrong pin and report the presented fingerprint |
+| Upload revocation and temporary-file cleanup | FileService active-upload cancellation test and permission integration tests |
+| Windows/Linux physical communication | Not verified in this workspace |
+| mDNS multicast and firewall traversal | Not verified on physical devices |
+| Linux hotspot hardware | Not verified; adapter tests are mocked |
+| Windows hotspot hardware | Unavailable in the current unpackaged development build |
 
-## Troubleshooting
-
-- **No sessions appear:** use Refresh, check that multicast/mDNS is allowed, and try
-  manual local IPv4 address and port.
-- **Manual connection fails:** confirm the host still shows an active session, the
-  address is reachable from the participant, and inbound TCP is allowed for the
-  displayed random port.
-- **Join code rejected:** re-enter the host's current code. Codes change when sessions
-  are recreated and are not IP addresses.
-- **Host approves but participant does not connect:** inspect firewall prompts and
-  client isolation. The participant must reach the displayed host address and port.
-- **Hotspot clients cannot join:** some access points isolate associated clients. Use
-  an existing LAN with client communication enabled to distinguish that from session
-  logic.
-
-This is a manual physical-device test procedure. It was not performed as part of the
-automated verification unless marked below.
+Loopback TLS verifies local protocol integration. It does not establish that a
+physical Windows/Linux pair can communicate through a specific router or firewall.
+The self-signed fingerprint must be compared independently to authenticate the host.
+TLS is transport encryption only; Version 0.5 does not implement end-to-end
+encryption or persistent peer trust.

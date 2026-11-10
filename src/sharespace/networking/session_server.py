@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import socket
+import ssl
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -24,7 +25,10 @@ from sharespace.core.models import (
     JoinRequestCreated,
     JoinRequestPoll,
     JoinRequestStatus,
+    ParticipantPermissionUpdate,
+    PermissionLevel,
     PublicSession,
+    TransferDirection,
 )
 from sharespace.core.session_manager import (
     InvalidCredential,
@@ -37,6 +41,7 @@ from sharespace.core.session_manager import (
 from sharespace.core.transfer_manager import TransferCancelled, TransferNotFound
 from sharespace.networking.file_routes import create_file_router
 from sharespace.networking.file_service import FileService
+from sharespace.networking.tls_security import SessionCertificateManager
 
 logger = logging.getLogger(__name__)
 API_PREFIX = "/api/v1"
@@ -46,17 +51,21 @@ class EventBroker:
     """Fan out small session-state events to currently connected WebSockets."""
 
     def __init__(self, *, queue_size: int = 100) -> None:
-        self._queues: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._queues: dict[asyncio.Queue[dict[str, Any]], str | None] = {}
         self._active_participants: set[str] = set()
         self._queue_size = queue_size
 
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=self._queue_size)
-        self._queues.add(queue)
+        self._queues[queue] = None
         return queue
 
     def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
-        self._queues.discard(queue)
+        self._queues.pop(queue, None)
+
+    def bind_participant(self, queue: asyncio.Queue[dict[str, Any]], participant_id: str) -> None:
+        if queue in self._queues:
+            self._queues[queue] = participant_id
 
     def claim_participant(self, participant_id: str) -> bool:
         """Allow only one live WebSocket for a participant token at a time."""
@@ -68,8 +77,15 @@ class EventBroker:
     def release_participant(self, participant_id: str) -> None:
         self._active_participants.discard(participant_id)
 
-    async def publish(self, event: dict[str, Any]) -> None:
-        for queue in tuple(self._queues):
+    async def publish(
+        self,
+        event: dict[str, Any],
+        *,
+        target_participant_id: str | None = None,
+    ) -> None:
+        for queue, participant_id in tuple(self._queues.items()):
+            if target_participant_id is not None and participant_id != target_participant_id:
+                continue
             if queue.full():
                 with contextlib.suppress(asyncio.QueueEmpty):
                     queue.get_nowait()
@@ -95,6 +111,7 @@ def create_session_app(
                 await asyncio.sleep(monitor_interval_seconds)
                 for change in manager.expire_inactive():
                     await broker.publish({"type": change})
+                await files.cancel_disconnected_participants(manager.connected_participant_ids())
 
         monitor_task = asyncio.create_task(monitor(), name="sharespace-heartbeat-monitor")
         try:
@@ -106,7 +123,7 @@ def create_session_app(
 
     app = FastAPI(
         title="ShareSpace Local Session API",
-        version="0.4.0",
+        version="0.5.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -133,6 +150,7 @@ def create_session_app(
 
     @app.exception_handler(SessionError)
     async def session_error_handler(_request: Request, error: SessionError) -> JSONResponse:
+        logger.warning("Session authorization rejected: %s", error.code)
         if isinstance(error, InvalidCredential):
             status_code = 401
         elif isinstance(error, PermissionDenied):
@@ -236,13 +254,64 @@ def create_session_app(
         participant_id: str,
         authorization: str | None = Header(default=None),
     ) -> dict[str, str]:
-        participant = manager.disconnect_participant(participant_id, bearer(authorization, host=True))
+        host_token = bearer(authorization, host=True)
+        async with files.authorization_gate:
+            participant = manager.disconnect_participant(participant_id, host_token)
+            files.transfers.cancel_active(participant_id=participant_id)
+        logger.info("Participant disconnected by host: participant_id=%s", participant_id)
         await broker.publish({"type": "participant_disconnected", "participant_id": participant_id})
         return {"status": participant.status.value, "participant_id": participant_id}
 
+    @app.post(f"{API_PREFIX}/host/participants/{{participant_id}}/permissions")
+    async def set_participant_permission(
+        participant_id: str,
+        data: ParticipantPermissionUpdate,
+        authorization: str | None = Header(default=None),
+    ):
+        host_token = bearer(authorization, host=True)
+        async with files.authorization_gate:
+            before = next(
+                (
+                    item for item in manager.host_snapshot(host_token)[2]
+                    if item.participant_id == participant_id
+                ),
+                None,
+            )
+            if before is None or before.role.value != "PARTICIPANT":
+                raise SessionUnavailable("Participant not found.")
+            participant = manager.set_participant_permission(
+                participant_id, data.permission, host_token
+            )
+            if (
+                before.permission is PermissionLevel.READ_WRITE
+                and data.permission is PermissionLevel.READ_ONLY
+            ):
+                files.transfers.cancel_active(
+                    direction=TransferDirection.UPLOAD,
+                    participant_id=participant_id,
+                )
+        logger.info(
+            "Participant permission changed: participant_id=%s permission=%s",
+            participant_id,
+            participant.permission.value if participant.permission else "none",
+        )
+        await broker.publish(
+            {
+                "type": "participant_permission_changed",
+                "participant_id": participant_id,
+                "permission": participant.permission.value if participant.permission else None,
+            },
+            target_participant_id=participant_id,
+        )
+        return participant
+
     @app.post(f"{API_PREFIX}/host/end")
     async def end_session(authorization: str | None = Header(default=None)) -> dict[str, str]:
-        session = manager.end_session(bearer(authorization, host=True))
+        host_token = bearer(authorization, host=True)
+        async with files.authorization_gate:
+            session = manager.end_session(host_token)
+            files.transfers.cancel_active()
+            files.set_uploads_enabled(False)
         await broker.publish({"type": "session_ended", "session_id": session.session_id})
         return {"status": "ended", "session_id": session.session_id}
 
@@ -271,19 +340,23 @@ def create_session_app(
                 return
             if manager.host_token_valid(token):
                 role = "host"
+                permission = None
             else:
                 participant = manager.authenticate_participant(token)
                 participant_id = participant.participant_id
+                permission = participant.permission.value if participant.permission else None
                 if not broker.claim_participant(participant_id):
                     await websocket.close(code=1008, reason="This participant is already connected.")
                     return
                 participant_claimed = True
+                broker.bind_participant(queue, participant_id)
                 role = "participant"
             await websocket.send_json(
                 {
                     "type": "authenticated",
                     "role": role.upper(),
                     "participant_id": participant_id,
+                    "permission": permission,
                     "heartbeat_interval_seconds": 5,
                 }
             )
@@ -318,34 +391,45 @@ def create_session_app(
                     ):
                         await websocket.close(code=4003, reason="Host disconnected this participant.")
                         return
-        except SessionError:
+        except SessionError as error:
+            logger.warning("Session WebSocket authorization rejected: %s", error.code)
             with contextlib.suppress(Exception):
                 await websocket.send_json({"type": "error", "code": "unauthorized"})
                 await websocket.close(code=1008, reason="Credentials are invalid or expired.")
         except WebSocketDisconnect:
             pass
-        except Exception:
-            logger.exception("Session WebSocket failed.")
+        except Exception as error:
+            logger.warning("Session WebSocket failed (%s).", type(error).__name__)
             with contextlib.suppress(Exception):
                 await websocket.close(code=1011, reason="Session connection failed.")
         finally:
             broker.unsubscribe(queue)
             if participant_id and participant_claimed:
-                participant = manager.participant_disconnected(participant_id)
+                async with files.authorization_gate:
+                    participant = manager.participant_disconnected(participant_id)
+                    files.transfers.cancel_active(participant_id=participant_id)
                 broker.release_participant(participant_id)
                 if participant is not None:
+                    logger.info("Participant WebSocket disconnected: participant_id=%s", participant_id)
                     await broker.publish({"type": "participant_disconnected", "participant_id": participant_id})
 
-    app.include_router(create_file_router(manager, files))
+    app.include_router(create_file_router(manager, files, event_broker=broker))
     return app
 
 
 class SessionServer:
     """Run one FastAPI session server in a background thread on an ephemeral port."""
 
-    def __init__(self, manager: SessionManager | None = None, *, ready_timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        manager: SessionManager | None = None,
+        *,
+        ready_timeout: float = 10.0,
+        certificate_manager: SessionCertificateManager | None = None,
+    ) -> None:
         self.manager = manager or SessionManager()
         self.file_service = FileService()
+        self.certificate_manager = certificate_manager or SessionCertificateManager()
         self.ready_timeout = ready_timeout
         self._server: uvicorn.Server | None = None
         self._socket: socket.socket | None = None
@@ -368,23 +452,30 @@ class SessionServer:
         host_device_name: str,
         host_os: str,
         host_ip: str,
+        host_addresses: tuple[str, ...] | list[str] | None = None,
     ) -> tuple[PublicSession, str, str]:
         """Bind a random local port, create the session, and start Uvicorn."""
         if self._thread is not None and self._thread.is_alive():
             raise RuntimeError("This session server is already running.")
         bind_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         bind_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        credentials = None
         try:
             bind_socket.bind(("0.0.0.0", 0))
             bind_socket.listen(128)
             bind_socket.setblocking(False)
             port = int(bind_socket.getsockname()[1])
+            addresses = list(host_addresses or ())
+            if host_ip not in addresses:
+                addresses.insert(0, host_ip)
+            certificate = self.certificate_manager.generate(addresses)
             session, credentials = self.manager.create_session(
                 session_name=session_name,
                 host_device_name=host_device_name,
                 host_os=host_os,
                 host_ip=host_ip,
                 port=port,
+                certificate_fingerprint=certificate.fingerprint,
             )
             server = uvicorn.Server(
                 uvicorn.Config(
@@ -395,6 +486,9 @@ class SessionServer:
                     access_log=False,
                     lifespan="on",
                     timeout_graceful_shutdown=2,
+                    ssl_certfile=str(certificate.certificate_path),
+                    ssl_keyfile=str(certificate.private_key_path),
+                    ssl_context_factory=_tls_server_context_factory,
                 )
             )
             thread = threading.Thread(
@@ -417,7 +511,13 @@ class SessionServer:
                 self.manager.end_session(credentials.host_token)
                 raise RuntimeError("The local session server did not start.")
             return session, credentials.joining_code, credentials.host_token
-        except Exception:
+        except Exception as error:
+            logger.error("Local TLS session startup failed (%s).", type(error).__name__)
+            if credentials is not None:
+                with contextlib.suppress(Exception):
+                    self.manager.end_session(credentials.host_token)
+            self.file_service.cleanup()
+            self.certificate_manager.cleanup()
             with contextlib.suppress(OSError):
                 bind_socket.close()
             if self._thread is None or not self._thread.is_alive():
@@ -442,3 +542,10 @@ class SessionServer:
         self._host_token = None
         self.file_service.stop_sharing()
         self.file_service.cleanup()
+        self.certificate_manager.cleanup()
+
+
+def _tls_server_context_factory(_config, default_factory):
+    context = default_factory()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
