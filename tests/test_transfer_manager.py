@@ -16,6 +16,7 @@ def test_progress_and_completion_require_exact_byte_count():
     with pytest.raises(ValueError):
         manager.complete(created.transfer_id)
     manager.advance(created.transfer_id, 3)
+    assert manager.get(created.transfer_id).progress_percent < 100
     completed = manager.complete(created.transfer_id)
     assert completed.status is TransferStatus.COMPLETED
     assert completed.progress_percent == 100

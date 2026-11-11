@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 
-from sharespace.core.models import DirectoryListing, FileItem, FileItemType, SharedDirectoryState
+from sharespace.core.models import (
+    DirectoryListing, FileItem, FileItemType, SearchResults, SharedDirectoryState,
+)
 
 MAX_FILE_SIZE_BYTES = 20_000_000
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -136,6 +138,72 @@ class SharedDirectoryManager:
             shared_directory_name=root.name,
             items=items,
         )
+
+    def search(self, query: str, *, limit: int = 200) -> SearchResults:
+        """Search visible filenames and folders without reading file contents."""
+        if not isinstance(query, str) or not query.strip() or len(query) > 128:
+            raise FileAccessError("Enter a search term up to 128 characters.", "invalid_search")
+        if any(ord(character) < 32 or ord(character) == 127 for character in query):
+            raise FileAccessError("The search term contains unsupported characters.", "invalid_search")
+        if not 1 <= limit <= 500:
+            raise FileAccessError("The search result limit is invalid.", "invalid_search")
+        needle = query.casefold()
+        root = self._require_root()
+        pending = [root]
+        matches: list[FileItem] = []
+        truncated = False
+        while pending:
+            directory = pending.pop()
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
+                # An inaccessible subtree is skipped; other visible folders remain searchable.
+                continue
+            for entry in entries:
+                path = Path(entry.path)
+                if self._is_hidden(path):
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                    if self._is_link_or_reparse(info):
+                        continue
+                    is_directory = stat.S_ISDIR(info.st_mode)
+                    is_regular = stat.S_ISREG(info.st_mode)
+                    if not is_directory and not is_regular:
+                        continue
+                    if entry.name.startswith(".sharespace-") and entry.name.endswith(".part"):
+                        continue
+                    resolved = path.resolve(strict=True)
+                    self._ensure_contained(resolved, root)
+                    if is_directory:
+                        pending.append(resolved)
+                    if needle not in entry.name.casefold():
+                        continue
+                    relative = path.relative_to(root).as_posix()
+                    if is_directory:
+                        accessible = os.access(resolved, os.R_OK | os.X_OK)
+                    else:
+                        accessible = os.access(resolved, os.R_OK)
+                    matches.append(FileItem(
+                        filename=entry.name,
+                        relative_path=relative,
+                        extension=path.suffix.lower() if is_regular else "",
+                        size_bytes=info.st_size if is_regular else 0,
+                        modified_at=datetime.fromtimestamp(info.st_mtime, timezone.utc),
+                        item_type=FileItemType.DIRECTORY if is_directory else FileItemType.FILE,
+                        accessible=accessible,
+                        unavailable_reason=None if accessible else "Item is unavailable.",
+                    ))
+                except (OSError, RuntimeError, ValueError):
+                    # A concurrently removed/replaced entry is not returned or followed.
+                    continue
+        matches.sort(key=lambda item: (
+            item.item_type is FileItemType.FILE,
+            item.filename.casefold(), item.filename,
+            item.relative_path.casefold(), item.relative_path,
+        ))
+        truncated = len(matches) > limit
+        return SearchResults(query=query, results=matches[:limit], truncated=truncated)
 
     def resolve(self, relative_path: str, *, expect_file: bool = False) -> Path:
         root = self._require_root()

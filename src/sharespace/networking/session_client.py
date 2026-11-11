@@ -23,6 +23,7 @@ from sharespace.networking.tls_security import (
 from sharespace.networking.websocket_events import RecentEventIds, validate_wire_event
 
 logger = logging.getLogger(__name__)
+MAX_EVENT_RECONNECT_ATTEMPTS = 12
 
 
 class SessionClientError(RuntimeError):
@@ -149,12 +150,21 @@ class SessionClient:
         """Reconnect and consume events; participant clients send heartbeats."""
         uri = f"wss://{self.host}:{self.port}{API_PREFIX}/sessions/{session_id}/events"
         retry_delay = 1.0
+        attempts = 0
+        last_state: str | None = None
+
+        def emit_state(value: str) -> None:
+            nonlocal last_state
+            if on_connection_state is not None and value != last_state:
+                last_state = value
+                on_connection_state(value)
+
         recent_ids = RecentEventIds()
         while not stop_event.is_set():
             try:
+                emit_state("verifying_tls")
                 await self.security.verify_peer()
-                if on_connection_state:
-                    on_connection_state("connecting")
+                emit_state("connecting")
                 async with websockets.connect(
                     uri,
                     ssl=self.security.ssl_context,
@@ -169,8 +179,8 @@ class SessionClient:
                         raise SessionClientError("Session WebSocket authentication failed.")
                     on_event(auth)
                     retry_delay = 1.0
-                    if on_connection_state:
-                        on_connection_state("connected")
+                    attempts = 0
+                    emit_state("connected")
                     last_heartbeat = asyncio.get_running_loop().time()
                     while not stop_event.is_set():
                         now = asyncio.get_running_loop().time()
@@ -196,8 +206,7 @@ class SessionClient:
                                 return
             except TLSVerificationError as error:
                 on_event({"type": "session_security_error", "detail": str(error)})
-                if on_connection_state:
-                    on_connection_state("security_error")
+                emit_state("security_error")
                 return
             except ssl.SSLCertVerificationError:
                 replacement = await self.security.inspect_changed_fingerprint()
@@ -207,29 +216,29 @@ class SessionClient:
                         "detail": "The host certificate changed. Verify it again through a trusted channel.",
                         "presented_fingerprint": replacement,
                     })
-                    if on_connection_state:
-                        on_connection_state("security_error")
+                    emit_state("security_error")
                     return
                 logger.warning("The verified session certificate failed TLS validation.")
                 on_event({
                     "type": "session_security_error",
                     "detail": "The host certificate failed TLS validation.",
                 })
-                if on_connection_state:
-                    on_connection_state("security_error")
+                emit_state("security_error")
                 return
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                if on_connection_state:
-                    on_connection_state("disconnected")
+                emit_state("disconnected")
                 logger.debug("Session event connection interrupted (%s).", type(error).__name__)
                 if stop_event.is_set():
                     break
+                attempts += 1
+                if attempts >= MAX_EVENT_RECONNECT_ATTEMPTS:
+                    emit_state("host_unavailable")
+                    return
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 10.0)
-        if on_connection_state:
-            on_connection_state("stopped")
+        emit_state("stopped")
 
     async def _request(
         self,

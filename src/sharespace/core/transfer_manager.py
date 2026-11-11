@@ -6,8 +6,13 @@ import threading
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
+import logging
+from collections.abc import Callable
 
 from sharespace.core.models import TransferDirection, TransferStatus, TransferView
+
+logger = logging.getLogger(__name__)
+_PERSIST_PROGRESS_INTERVAL = 1024 * 1024
 
 
 class TransferNotFound(LookupError):
@@ -26,6 +31,7 @@ class _Transfer:
         self.direction = direction
         self.total = total
         self.transferred = 0
+        self.persisted_transferred = 0
         self.participant_id = participant_id
         self.status = TransferStatus.QUEUED
         self.started_at = datetime.now(timezone.utc)
@@ -35,7 +41,7 @@ class _Transfer:
 
     def view(self) -> TransferView:
         percent = 100.0 if self.status is TransferStatus.COMPLETED else (
-            min(100.0, self.transferred * 100.0 / self.total) if self.total else 0.0
+            min(99.0, self.transferred * 100.0 / self.total) if self.total else 0.0
         )
         return TransferView(
             transfer_id=self.transfer_id, filename=self.filename, direction=self.direction,
@@ -48,10 +54,14 @@ class _Transfer:
 class TransferManager:
     """Track active and recent transfers without persisting file or peer secrets."""
 
-    def __init__(self, *, history_limit: int = 250) -> None:
+    def __init__(
+        self, *, history_limit: int = 250,
+        on_change: Callable[[TransferView], None] | None = None,
+    ) -> None:
         self._lock = threading.RLock()
         self._transfers: OrderedDict[str, _Transfer] = OrderedDict()
         self._history_limit = max(10, history_limit)
+        self._on_change = on_change
 
     def create(self, *, filename: str, direction: TransferDirection, total: int,
                participant_id: str, transfer_id: str | None = None) -> TransferView:
@@ -64,7 +74,9 @@ class TransferManager:
                 raise ValueError("Transfer ID is already in use.")
             self._transfers[record.transfer_id] = record
             self._prune()
-            return record.view()
+            view = record.view()
+        self._notify(view)
+        return view
 
     def begin(self, transfer_id: str) -> None:
         with self._lock:
@@ -72,6 +84,8 @@ class TransferManager:
             if record.status is not TransferStatus.QUEUED:
                 raise TransferCancelled("Transfer is no longer active.")
             record.status = TransferStatus.IN_PROGRESS
+            view = record.view()
+        self._notify(view)
 
     def set_total(self, transfer_id: str, total: int) -> TransferView:
         if total < 0:
@@ -96,7 +110,15 @@ class TransferManager:
             if record.transferred > record.total:
                 raise ValueError("Transferred bytes exceed the declared file size.")
             record.status = TransferStatus.IN_PROGRESS
-            return record.transferred
+            transferred = record.transferred
+            if transferred - record.persisted_transferred >= _PERSIST_PROGRESS_INTERVAL:
+                record.persisted_transferred = transferred
+                view = record.view()
+            else:
+                view = None
+        if view is not None:
+            self._notify(view)
+        return transferred
 
     def complete(self, transfer_id: str) -> TransferView:
         with self._lock:
@@ -108,7 +130,9 @@ class TransferManager:
             record.status = TransferStatus.COMPLETED
             record.completed_at = datetime.now(timezone.utc)
             self._prune()
-            return record.view()
+            view = record.view()
+        self._notify(view)
+        return view
 
     def fail(self, transfer_id: str, message: str) -> TransferView:
         return self._finish(transfer_id, TransferStatus.FAILED, message)
@@ -123,7 +147,9 @@ class TransferManager:
                 record.status = TransferStatus.CANCELLED
                 record.completed_at = datetime.now(timezone.utc)
             self._prune()
-            return record.view()
+            view = record.view()
+        self._notify(view)
+        return view
 
     def cancel_active(
         self,
@@ -131,6 +157,7 @@ class TransferManager:
         direction: TransferDirection | None = None,
         participant_id: str | None = None,
     ) -> None:
+        changed: list[TransferView] = []
         with self._lock:
             for record in self._transfers.values():
                 if record.status in {TransferStatus.QUEUED, TransferStatus.IN_PROGRESS} and (
@@ -141,8 +168,12 @@ class TransferManager:
                     record.cancel_event.set()
                     record.status = TransferStatus.CANCELLED
                     record.completed_at = datetime.now(timezone.utc)
+                    changed.append(record.view())
+        for view in changed:
+            self._notify(view)
 
     def cancel_disconnected_participants(self, connected_participant_ids: set[str]) -> None:
+        changed: list[TransferView] = []
         with self._lock:
             for record in self._transfers.values():
                 if (
@@ -152,6 +183,9 @@ class TransferManager:
                     record.cancel_event.set()
                     record.status = TransferStatus.CANCELLED
                     record.completed_at = datetime.now(timezone.utc)
+                    changed.append(record.view())
+        for view in changed:
+            self._notify(view)
 
     def cancellation_event(self, transfer_id: str) -> threading.Event:
         with self._lock:
@@ -179,7 +213,19 @@ class TransferManager:
                 record.error = message[:200]
                 record.completed_at = datetime.now(timezone.utc)
             self._prune()
-            return record.view()
+            view = record.view()
+        self._notify(view)
+        return view
+
+    def _notify(self, view: TransferView) -> None:
+        if self._on_change is None:
+            return
+        try:
+            self._on_change(view)
+        except Exception:
+            # Persistence errors are logged and must not corrupt the authoritative
+            # in-memory transfer lifecycle or interrupt streaming.
+            logger.exception("Could not persist transfer history for %s.", view.transfer_id)
 
     def _get(self, transfer_id: str) -> _Transfer:
         record = self._transfers.get(transfer_id)

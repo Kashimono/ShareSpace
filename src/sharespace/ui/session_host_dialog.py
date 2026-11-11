@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from dataclasses import dataclass
 
@@ -38,7 +39,10 @@ from sharespace.networking.session_client import SessionClient
 from sharespace.networking.session_server import SessionServer
 from sharespace.platform.platform_manager import PlatformManager
 from sharespace.ui.notification_manager import NotificationManager
+from sharespace.ui.error_messages import user_facing_error
 from sharespace.ui.session_workers import SessionEventWorker, SessionWorker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -62,6 +66,8 @@ class SessionHostDialog(QDialog):
         preferred_host_ip: str | None = None,
         hotspot_manager: PlatformManager | None = None,
         stop_hotspot_on_end: bool = False,
+        store=None,
+        preferences: dict[str, object] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -69,6 +75,8 @@ class SessionHostDialog(QDialog):
         self._preferred_host_ip = preferred_host_ip
         self._hotspot_manager = hotspot_manager
         self._stop_hotspot_on_end = stop_hotspot_on_end
+        self._store = store
+        self._preferences = preferences or {}
         self._runtime: _HostRuntime | None = None
         self._client: SessionClient | None = None
         self._thread_pool = QThreadPool(self)
@@ -90,11 +98,16 @@ class SessionHostDialog(QDialog):
         heading = QLabel("Host session")
         heading.setStyleSheet("font-size: 22px; font-weight: 700;")
         layout.addWidget(heading)
-        self._notifications = NotificationManager(self, layout)
+        self._notifications = NotificationManager(
+            self, layout, preferences=self._preferences.get("notifications")
+        )
         self._status = QLabel("Starting the local session server…")
         self._status.setWordWrap(True)
         self._status.setStyleSheet("color: #4357c5; font-weight: 600;")
         layout.addWidget(self._status)
+        self._health_label = QLabel("Server starting · Session starting · File monitor starting")
+        self._health_label.setWordWrap(True)
+        layout.addWidget(self._health_label)
         self._activity_label = QLabel("No recent session activity.")
         self._activity_label.setWordWrap(True)
         self._activity_label.setStyleSheet("color: #536177;")
@@ -247,7 +260,7 @@ class SessionHostDialog(QDialog):
                 for item in device_manager.get_local_addresses()
                 if item.address != address.address
             ]
-            server = SessionServer()
+            server = SessionServer(history_store=self._store)
             session, joining_code, host_token = server.start(
                 session_name=self._session_name or "ShareSpace session",
                 host_device_name=device_manager.hostname,
@@ -312,10 +325,21 @@ class SessionHostDialog(QDialog):
         self._file_timer.start()
         self._refresh_snapshot()
         self._refresh_file_state()
+        self._update_health()
         self._update_actions()
 
     def _session_start_failed(self, message: str) -> None:
         self._busy = False
+        if self._store is not None:
+            try:
+                self._store.record_failed_session(
+                    session_id=None,
+                    session_name=self._session_name or "ShareSpace session",
+                    host_device_name=DeviceManager().hostname,
+                    role="HOST",
+                )
+            except Exception:
+                logger.exception("Could not save failed host-session history.")
         self._status.setText(f"Could not start the session: {message}")
         self._status.setStyleSheet("color: #b42318; font-weight: 600;")
         self._end_button.setText("Close")
@@ -366,7 +390,7 @@ class SessionHostDialog(QDialog):
                 "file_deleted": ("File removed", "Shared file removed"),
             }[event_type]
             self._activity_label.setText(f"{label}: {filename}")
-            self._notifications.notify(title, str(filename), event_id=event_id)
+            self._notifications.notify(title, str(filename), event_id=event_id, category=event_type)
         elif event_type in {"participant_connected", "participant_disconnected"}:
             name = data.get("device_name", "A participant")
             joined = event_type == "participant_connected"
@@ -375,6 +399,7 @@ class SessionHostDialog(QDialog):
                 "Participant joined" if joined else "Participant left",
                 str(name),
                 event_id=event_id,
+                category="participant_activity",
             )
         elif event_type == "shared_directory_unavailable":
             self._activity_label.setText("The shared directory is unavailable.")
@@ -385,9 +410,14 @@ class SessionHostDialog(QDialog):
         elif event_type in {"file_sharing_state_changed", "session_resync_required"}:
             self._refresh_file_state()
         self._refresh_snapshot()
+        self._update_health()
 
     def _on_stream_state(self, state: str) -> None:
-        if state == "security_error" and self._runtime is not None:
+        if state == "verifying_tls" and self._runtime is not None:
+            self._status.setText("Verifying the local TLS certificate for live session events…")
+        elif state == "connecting" and self._runtime is not None:
+            self._status.setText("TLS verified. Connecting to live session events…")
+        elif state == "security_error" and self._runtime is not None:
             self._security_status.setText("TLS certificate validation failed for the live session connection.")
             self._security_status.setStyleSheet("color: #b42318; font-weight: 600;")
         elif state == "disconnected" and self._runtime is not None:
@@ -397,6 +427,14 @@ class SessionHostDialog(QDialog):
                 self._status.setText("Session active; automatic discovery is unavailable.")
             else:
                 self._status.setText("Session active and advertised on the local network.")
+        elif state == "host_unavailable" and self._runtime is not None:
+            if self._runtime.server.server_running:
+                self._status.setText("Session is active, but its live event connection is unavailable.")
+            else:
+                self._status.setText("The local session server stopped unexpectedly.")
+                self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+                self._finish_host_history("FAILED")
+        self._update_health()
 
     def _refresh_snapshot(self) -> None:
         if self._refresh_busy or self._client is None or self._runtime is None:
@@ -411,6 +449,14 @@ class SessionHostDialog(QDialog):
         self._refresh_busy = False
         snapshot: HostSnapshot = result
         self._count_label.setText(f"{snapshot.session.participant_count} connected")
+        if self._store is not None and self._runtime.server.history_record_id:
+            try:
+                self._store.update_session_participant_count(
+                    self._runtime.server.history_record_id,
+                    max(0, snapshot.session.participant_count - 1),
+                )
+            except Exception:
+                logger.exception("Could not update hosted session history.")
         if self._client and self._client.certificate_verified:
             self._security_status.setText(
                 f"TLS {self._client.tls_version} active; the host certificate is verified."
@@ -464,11 +510,18 @@ class SessionHostDialog(QDialog):
             self._participants.setCurrentItem(selected_participant)
         self._participants.blockSignals(False)
         self._update_actions()
+        self._update_health()
 
     def _snapshot_failed(self, message: str) -> None:
         self._refresh_busy = False
         if self._runtime is not None:
-            self._status.setText(f"Session active; could not refresh participant state: {message}")
+            if not self._runtime.server.server_running:
+                self._status.setText("The local session server stopped unexpectedly.")
+                self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+                self._finish_host_history("FAILED")
+            else:
+                self._status.setText(f"Session is active; participant status could not be refreshed: {message}")
+            self._update_health()
 
     def _choose_shared_folder(self) -> None:
         runtime = self._runtime
@@ -611,7 +664,45 @@ class SessionHostDialog(QDialog):
         if selected:
             self._transfers.setCurrentItem(selected)
         self._transfers.blockSignals(False)
+        self._update_health()
         self._update_actions()
+
+    def _update_health(self) -> None:
+        runtime = self._runtime
+        if runtime is None:
+            self._health_label.setText("Server starting · Session starting · File monitor starting")
+            return
+        service = runtime.server.file_service
+        state = service.state()
+        transfers = service.transfers.list()
+        active_transfers = sum(
+            transfer.status in {TransferStatus.QUEUED, TransferStatus.IN_PROGRESS}
+            for transfer in transfers
+        )
+        folder_state = "available" if state.available else (
+            "unavailable" if state.shared else "not selected"
+        )
+        participants = len(runtime.server.manager.connected_participants())
+        monitor_state = "active" if runtime.server.file_monitor_running else "inactive"
+        self._health_label.setText(
+            f"Server {'running' if runtime.server.server_running else 'stopped'} · "
+            f"Session {'active' if runtime.server.manager.active_session else 'ended'} · "
+            f"{participants} participant(s) · Shared folder {folder_state} · "
+            f"File monitor {monitor_state} · {runtime.server.event_stream_count} live event stream(s) · "
+            f"{active_transfers} active transfer(s)"
+        )
+
+    def _finish_host_history(self, outcome: str) -> None:
+        if self._store is None or self._runtime is None:
+            return
+        record_id = self._runtime.server.history_record_id
+        if record_id is None:
+            return
+        self._runtime.server.history_record_id = None
+        try:
+            self._store.finish_session(record_id, outcome)
+        except Exception:
+            logger.exception("Could not finalize hosted session history.")
 
     def _cancel_transfer(self) -> None:
         item = self._transfers.currentItem()
@@ -702,7 +793,7 @@ class SessionHostDialog(QDialog):
                 try:
                     asyncio.run(self._client.end_session(runtime.host_token))
                 except Exception as error:
-                    failures.append(f"Session notification failed: {error}")
+                    failures.append(f"Session notification failed: {user_facing_error(error)}")
                     try:
                         runtime.server.manager.end_session(runtime.host_token)
                     except Exception:
@@ -710,16 +801,21 @@ class SessionHostDialog(QDialog):
             try:
                 runtime.advertiser.stop()
             except Exception as error:
-                failures.append(f"Discovery cleanup failed: {error}")
+                failures.append(f"Discovery cleanup failed: {user_facing_error(error)}")
             try:
                 runtime.server.stop()
             except Exception as error:
-                failures.append(f"Session server cleanup failed: {error}")
-            if self._stop_hotspot_on_end and self._hotspot_manager is not None:
+                failures.append(f"Session server cleanup failed: {user_facing_error(error)}")
+            if runtime.server.server_running:
+                failures.append("The local session server is still stopping. Retry cleanup before closing.")
+            if (
+                not runtime.server.server_running
+                and self._stop_hotspot_on_end and self._hotspot_manager is not None
+            ):
                 try:
                     self._hotspot_manager.stop_hotspot()
                 except Exception as error:
-                    failures.append(f"Hotspot cleanup failed: {error}")
+                    failures.append(f"Hotspot cleanup failed: {user_facing_error(error)}")
             return "\n".join(failures)
 
         worker = SessionWorker(cleanup)
@@ -729,6 +825,12 @@ class SessionHostDialog(QDialog):
 
     def _end_finished(self, failures: object) -> None:
         self._busy = False
+        if self._runtime is not None and self._runtime.server.server_running:
+            self._close_after_end = False
+            self._status.setText("The local server is still running. Retry ending the session before closing.")
+            QMessageBox.warning(self, "Session cleanup incomplete", str(failures))
+            self._update_actions()
+            return
         self._runtime = None
         if self._client is not None:
             self._client.close()
@@ -744,8 +846,11 @@ class SessionHostDialog(QDialog):
     def _end_failed(self, message: str) -> None:
         self._busy = False
         QMessageBox.warning(self, "Session cleanup failed", message)
-        if self._close_after_end:
+        if self._close_after_end and (self._runtime is None or not self._runtime.server.server_running):
             self.accept()
+        else:
+            self._close_after_end = False
+            self._update_actions()
 
     def _update_actions(self) -> None:
         available = self._runtime is not None and not self._busy

@@ -28,6 +28,7 @@ from sharespace.platform.base_hotspot import (
     SupportCheck,
     WifiAdapter,
 )
+from sharespace.ui.error_messages import user_facing_error
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +51,17 @@ class _Worker(QRunnable):
             self.signals.finished.emit(self.function())
         except Exception as error:
             logger.exception("Hotspot operation failed.")
-            self.signals.failed.emit(str(error))
+            self.signals.failed.emit(user_facing_error(error))
 
 
 class HostSessionDialog(QDialog):
     """Configure, start, observe, and stop a temporary Wi-Fi hotspot."""
 
-    def __init__(self, platform_manager: object, parent=None) -> None:
+    def __init__(self, platform_manager: object, parent=None, *, store=None, preferences=None) -> None:
         super().__init__(parent)
         self._platform_manager = platform_manager
+        self._store = store
+        self._preferences = preferences or {}
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
         self._worker: _Worker | None = None
@@ -461,6 +464,8 @@ class HostSessionDialog(QDialog):
             preferred_host_ip=preferred_ip,
             hotspot_manager=self._platform_manager if use_hotspot else None,
             stop_hotspot_on_end=use_hotspot,
+            store=self._store,
+            preferences=self._preferences,
             parent=self,
         )
         dialog.exec()

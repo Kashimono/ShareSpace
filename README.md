@@ -1,10 +1,10 @@
 # ShareSpace
 
 ShareSpace is an offline-first local file-sharing application for Windows and Linux.
-Version 0.6.0 adds shared-folder live updates, participant activity events, and
-desktop notifications on top of per-participant upload permissions and TLS sessions.
-Runtime file sharing works over the local network and does not need a cloud service,
-public certificate authority, or internet connection.
+Version 0.7.0 adds tree-wide filename search, improved shared-folder browsing,
+persistent local transfer and session history, centralized settings, clearer connection
+states, and safer error reporting. Runtime sharing works over the local network and
+does not need a cloud service, public certificate authority, or internet connection.
 
 ## Development setup
 
@@ -65,8 +65,48 @@ disable for every participant.
 Each file is limited to 20,000,000 bytes (20 MB decimal). Uploads create new files
 only and fail if the destination name already exists. Paths shown to participants are
 relative to the shared directory. Hidden files and symbolic links are excluded, and
-traversal outside the selected directory is rejected. Transfer history is held only
-in memory and cleared with the session.
+traversal outside the selected directory is rejected.
+
+The participant browser now searches filenames and folder names throughout the shared
+tree. Search is case-insensitive, debounced, and runs away from the GUI thread. The
+authenticated `GET /api/v1/files/search?q=...` endpoint returns safe relative paths
+and metadata only; it never reads file contents. Each request returns at most 200
+results by default (500 maximum), and the UI indicates when results were limited.
+Search does not build an index, so large trees may take longer to scan. Breadcrumbs,
+parent navigation, sortable listings, readable sizes, search-result locations, and
+live event refreshes are available in the same browser. Upload access still requires
+both `READ_WRITE` and the host's global upload switch.
+
+## Local history and settings
+
+Transfer and session history and user preferences are stored in a local SQLite
+database under Qt's operating-system application-data location, outside any shared
+folder. The database uses schema versioning and the Python standard-library
+`sqlite3`; no database server or extra dependency is required. Transfer records are
+saved after each transfer starts, at bounded progress intervals, and when it finishes
+so a later launch can mark unfinished work `INTERRUPTED`. Downloads are completed in
+history only after the local destination is finalized. Uploads are completed only
+after the host publishes the file. Interrupted transfers are not resumed.
+
+Session history is written only after hosting succeeds or a participant has been
+authenticated. Normal termination, disconnection, failure, or an unclean application
+exit receives an appropriate outcome. Previous sessions are metadata only; they are
+not active or joinable and are never reconnected automatically. Transfer and session
+history screens support filtering and sorting. Clearing history requires confirmation
+and removes only terminal local history records, never shared files or active state.
+
+Settings include system, light, and dark appearance; notification categories; a
+default download folder; and history retention of 30, 90, or 365 days, or indefinitely.
+The download folder is selected with the operating system's folder picker and checked
+for availability. Settings do not change host sharing, active network connections, or
+security configuration. History and settings never include bearer credentials,
+joining codes, private keys, file contents, or absolute host shared-directory paths.
+
+The participant status distinguishes certificate verification, connection setup,
+authenticated TLS connection, reconnection, and host unavailability. Reconnection
+uses exponential delays capped at ten seconds and stops after twelve consecutive
+failures. The host dashboard reports server/session state, connected participants,
+shared-folder and monitor status, event streams, and active transfers.
 
 ## TLS and certificate trust
 
@@ -99,14 +139,19 @@ Run the automated suite with:
 
     python -m pytest -q
 
-Tests cover permissions, API authorization, upload cancellation and cleanup,
-certificate generation, fingerprint pinning, HTTPS/WSS loopback connections,
-filesystem event detection and filtering, event validation/backpressure, browser
-refresh hints, and notification fallback behavior. Filesystem and UI tests run on the
-current development OS; mocked notification checks do not verify actual desktop
-delivery. Loopback tests do not establish physical Windows/Linux connectivity,
-multicast reachability, firewall behavior, or hotspot support.
+The Version 0.7.0 Windows workspace run reports **105 passed, 3 skipped**, and one
+existing Starlette/HTTPX deprecation warning. The skips are symlink tests because
+symlink creation was unavailable in this environment. Tests cover file search and
+authorization, versioned database initialization and restart recovery, history and settings,
+connection retry states, file-browser behavior, transfer streaming, permissions,
+upload cancellation and cleanup, certificate pinning, HTTPS/WSS loopback connections,
+filesystem events, event validation/backpressure, and notification fallback. The
+Qt startup test uses the offscreen platform plugin. Windows filesystem monitoring was
+exercised; Linux filesystem monitoring and native Windows/Linux notification delivery
+have not been physically verified. Loopback tests do not establish physical
+Windows/Linux connectivity, multicast reachability, firewall behavior, or hotspot
+support.
 
-See [docs/architecture.md](docs/architecture.md) for module boundaries and API
-authorization, and [docs/networking-tests.md](docs/networking-tests.md) for coverage,
-limitations, and two-computer testing instructions.
+See [docs/architecture.md](docs/architecture.md) for module boundaries, persistence,
+search, and API authorization, and [docs/networking-tests.md](docs/networking-tests.md)
+for test coverage, limitations, and manual two-computer instructions.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import threading
 import uuid
 
@@ -29,6 +30,9 @@ from sharespace.networking.session_client import SessionClient
 from sharespace.ui.file_browser_dialog import FileBrowserDialog
 from sharespace.ui.notification_manager import NotificationManager
 from sharespace.ui.session_workers import SessionEventWorker, SessionWorker
+from sharespace.storage.local_store import utc_now
+
+logger = logging.getLogger(__name__)
 
 
 class SessionJoinDialog(QDialog):
@@ -36,8 +40,14 @@ class SessionJoinDialog(QDialog):
 
     discovery_changed = Signal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, parent: QWidget | None = None, *, store=None,
+        preferences: dict[str, object] | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._store = store
+        self._preferences = preferences or {}
+        self._history_record_id: str | None = None
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(4)
         self._discovery = SessionDiscovery(on_change=self.discovery_changed.emit)
@@ -58,6 +68,7 @@ class SessionJoinDialog(QDialog):
         self._discovery_busy = False
         self._join_busy = False
         self._poll_busy = False
+        self._poll_failure_count = 0
 
         self.setWindowTitle("Join a ShareSpace session")
         self.setMinimumSize(650, 570)
@@ -69,7 +80,9 @@ class SessionJoinDialog(QDialog):
         heading = QLabel("Join a session")
         heading.setStyleSheet("font-size: 22px; font-weight: 700;")
         layout.addWidget(heading)
-        self._notifications = NotificationManager(self, layout)
+        self._notifications = NotificationManager(
+            self, layout, preferences=self._preferences.get("notifications")
+        )
         self._status = QLabel("Discovering sessions on the local network…")
         self._status.setWordWrap(True)
         self._status.setStyleSheet("color: #4357c5; font-weight: 600;")
@@ -413,9 +426,12 @@ class SessionJoinDialog(QDialog):
         self._client = client
         self._request_id = created.request_id
         self._request_token = created.request_token
+        self._poll_failure_count = 0
         if created.status is JoinRequestStatus.REJECTED:
+            self._record_failed_attempt()
             self._status.setText("The host rejected the previous request from this device.")
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+            self._clear_join_request()
         elif created.status is JoinRequestStatus.APPROVED:
             self._status.setText("Request approved. Connecting to the session…")
             self._poll_timer.start()
@@ -426,6 +442,7 @@ class SessionJoinDialog(QDialog):
 
     def _join_request_failed(self, message: str) -> None:
         self._join_busy = False
+        self._record_failed_attempt()
         self._status.setText(f"Connection failed: {message}")
         self._status.setStyleSheet("color: #b42318; font-weight: 600;")
         self._update_buttons()
@@ -446,6 +463,7 @@ class SessionJoinDialog(QDialog):
 
     def _request_status_received(self, result: object) -> None:
         self._poll_busy = False
+        self._poll_failure_count = 0
         status = result.status
         if status is JoinRequestStatus.PENDING:
             self._status.setText("Request pending. Waiting for the host to review it…")
@@ -458,19 +476,44 @@ class SessionJoinDialog(QDialog):
             else:
                 self._status.setText("Request approved. Finishing connection setup…")
         elif status is JoinRequestStatus.REJECTED:
-            self._poll_timer.stop()
+            self._record_failed_attempt()
             self._status.setText("The host rejected your join request.")
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+            self._clear_join_request()
         else:
-            self._poll_timer.stop()
+            self._record_failed_attempt()
             self._status.setText("The join request expired. Submit a new request to try again.")
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+            self._clear_join_request()
         self._update_buttons()
 
     def _request_poll_failed(self, message: str) -> None:
         self._poll_busy = False
-        self._status.setText(f"Connection failed while checking the request: {message}")
-        self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+        self._poll_failure_count += 1
+        if self._poll_failure_count >= 3:
+            self._record_failed_attempt()
+            self._clear_join_request()
+            self._status.setText(
+                "Could not confirm the join request after several attempts. "
+                "The host may be unavailable. Check the connection and try again."
+            )
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+        else:
+            self._status.setText(
+                f"Could not check the join request ({self._poll_failure_count}/3). "
+                "Retrying automatically…"
+            )
+            self._status.setStyleSheet("color: #9a6700; font-weight: 600;")
+        self._update_buttons()
+
+    def _clear_join_request(self) -> None:
+        """Stop polling and allow a fresh request after a terminal outcome."""
+        self._poll_timer.stop()
+        self._poll_busy = False
+        self._poll_failure_count = 0
+        self._request_id = None
+        self._request_token = None
+        self._participant_token = None
 
     def _start_event_stream(self) -> None:
         if not self._client or not self._selected_session or not self._participant_token:
@@ -509,6 +552,22 @@ class SessionJoinDialog(QDialog):
                 event.get("permission", PermissionLevel.READ_ONLY.value)
             )
             self._participant_connected = True
+            if self._store is not None and self._history_record_id is None and self._selected_session is not None:
+                try:
+                    session = self._selected_session
+                    self._history_record_id = self._store.start_session(
+                        session_id=session.session_id,
+                        session_name=session.session_name,
+                        host_device_name=session.host_device_name,
+                        role="PARTICIPANT",
+                        started_at=utc_now(),
+                        participant_count=max(0, session.participant_count - 1),
+                    )
+                except Exception:
+                    logger.exception("Could not save joined session history.")
+            tls = self._client.tls_version if self._client else "TLS"
+            self._status.setText(f"Authenticated and connected securely using {tls}.")
+            self._status.setStyleSheet("color: #157347; font-weight: 600;")
             if self._file_browser is not None:
                 self._file_browser.apply_permission(self._permission)
             self._update_buttons()
@@ -533,6 +592,7 @@ class SessionJoinDialog(QDialog):
             ):
                 self._participant_connected = False
                 self._stream_stop.set()
+                self._finish_session_history("DISCONNECTED")
                 self._status.setText("The host disconnected this device from the session.")
                 self._status.setStyleSheet("color: #b42318; font-weight: 600;")
                 if self._file_browser is not None:
@@ -546,6 +606,7 @@ class SessionJoinDialog(QDialog):
                         "Participant joined" if event.get("type") == "participant_connected" else "Participant left",
                         name,
                         event_id=event.get("event_id") if isinstance(event.get("event_id"), str) else None,
+                        category="participant_activity",
                     )
         elif event.get("type") in {
             "file_created", "file_modified", "file_deleted", "shared_directory_changed",
@@ -566,9 +627,11 @@ class SessionJoinDialog(QDialog):
                         title,
                         str(filename),
                         event_id=event.get("event_id") if isinstance(event.get("event_id"), str) else None,
+                        category=event["type"],
                     )
         elif event.get("type") == "session_ended":
             self._participant_connected = False
+            self._finish_session_history("COMPLETED")
             self._poll_timer.stop()
             self._status.setText("The host ended the session.")
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
@@ -576,6 +639,7 @@ class SessionJoinDialog(QDialog):
                 self._file_browser.set_session_unavailable("The host ended the session.")
         elif event.get("type") == "session_security_error":
             self._participant_connected = False
+            self._finish_session_history("FAILED")
             self._stream_stop.set()
             detail = event.get("detail", "The host certificate could not be verified.")
             presented = event.get("presented_fingerprint")
@@ -590,6 +654,7 @@ class SessionJoinDialog(QDialog):
         elif event.get("type") == "error" and event.get("code") == "participant_disconnected":
             self._participant_connected = False
             self._stream_stop.set()
+            self._finish_session_history("DISCONNECTED")
             self._status.setText("The host disconnected this device from the session.")
             self._status.setStyleSheet("color: #b42318; font-weight: 600;")
             if self._file_browser is not None:
@@ -597,19 +662,37 @@ class SessionJoinDialog(QDialog):
                     "The host disconnected this device from the session."
                 )
     def _on_stream_state(self, state: str) -> None:
-        if state == "connected" and self._participant_token:
+        if state == "verifying_tls" and self._participant_token:
+            self._status.setText("Verifying the host certificate…")
+            self._status.setStyleSheet("color: #4357c5; font-weight: 600;")
+        elif state == "connecting" and self._participant_token:
+            self._status.setText("TLS verified. Establishing an authenticated session…")
+            self._status.setStyleSheet("color: #4357c5; font-weight: 600;")
+        elif state == "connected" and self._participant_token:
             self._participant_connected = True
             tls = self._client.tls_version if self._client else "TLS"
-            self._status.setText(f"Connected securely to the ShareSpace session using {tls}.")
+            self._status.setText(f"Authenticated session connected using verified {tls}.")
             self._status.setStyleSheet("color: #157347; font-weight: 600;")
             if self._file_browser is not None:
-                self._file_browser.recover_authoritative()
+                self._file_browser.set_session_available()
         elif state == "disconnected" and self._participant_token:
             self._participant_connected = False
             self._status.setText("Session connection interrupted; trying to reconnect…")
             self._status.setStyleSheet("color: #9a6700; font-weight: 600;")
+            if self._file_browser is not None:
+                self._file_browser.set_session_unavailable(
+                    "Session connection interrupted; trying to reconnect…"
+                )
+        elif state == "host_unavailable" and self._participant_token:
+            self._participant_connected = False
+            self._finish_session_history("DISCONNECTED")
+            self._status.setText("The host is unavailable. Rejoin when the host is ready.")
+            self._status.setStyleSheet("color: #b42318; font-weight: 600;")
+            if self._file_browser is not None:
+                self._file_browser.set_session_unavailable("The host is unavailable.")
         elif state == "security_error":
             self._participant_connected = False
+            self._finish_session_history("FAILED")
         self._update_buttons()
 
     def _open_file_browser(self) -> None:
@@ -618,9 +701,13 @@ class SessionJoinDialog(QDialog):
         if self._client is None:
             return
         client = FileClient(
-            *self._endpoint, self._participant_token, security=self._client.security
+            *self._endpoint, self._participant_token, security=self._client.security,
+            history_store=self._store,
         )
-        self._file_browser = FileBrowserDialog(client, self, permission=self._permission)
+        self._file_browser = FileBrowserDialog(
+            client, self, permission=self._permission, store=self._store,
+            preferences=self._preferences,
+        )
         self._file_browser.exec()
         self._file_browser = None
 
@@ -654,6 +741,8 @@ class SessionJoinDialog(QDialog):
         )
 
     def closeEvent(self, event) -> None:
+        if self._history_record_id is not None:
+            self._finish_session_history("DISCONNECTED")
         self._stream_stop.set()
         self._poll_timer.stop()
         self._discovery_timer.stop()
@@ -663,3 +752,26 @@ class SessionJoinDialog(QDialog):
             self._client.close()
         self._notifications.close()
         super().closeEvent(event)
+
+    def _record_failed_attempt(self) -> None:
+        session = self._selected_session
+        if self._store is None:
+            return
+        try:
+            self._store.record_failed_session(
+                session_id=session.session_id if session else None,
+                session_name=session.session_name if session else None,
+                host_device_name=session.host_device_name if session else "Unknown host",
+                role="PARTICIPANT",
+            )
+        except Exception:
+            logger.exception("Could not save failed session-join history.")
+
+    def _finish_session_history(self, outcome: str) -> None:
+        if self._history_record_id is None or self._store is None:
+            return
+        record_id, self._history_record_id = self._history_record_id, None
+        try:
+            self._store.finish_session(record_id, outcome)
+        except Exception:
+            logger.exception("Could not finalize joined session history.")

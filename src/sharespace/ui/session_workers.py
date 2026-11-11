@@ -7,6 +7,8 @@ import inspect
 import logging
 from collections.abc import Callable
 
+from sharespace.ui.error_messages import user_facing_error
+
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 logger = logging.getLogger(__name__)
@@ -36,7 +38,7 @@ class SessionWorker(QRunnable):
             self.signals.finished.emit(result)
         except Exception as error:
             logger.exception("Session operation failed.")
-            self.signals.failed.emit(str(error))
+            self.signals.failed.emit(user_facing_error(error))
 
 
 class SessionEventWorker(QRunnable):
@@ -55,4 +57,4 @@ class SessionEventWorker(QRunnable):
             self.signals.finished.emit(result)
         except Exception as error:
             logger.exception("Session event stream failed.")
-            self.signals.failed.emit(str(error))
+            self.signals.failed.emit(user_facing_error(error))

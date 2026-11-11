@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import asyncio
 import uuid
 
 from fastapi import APIRouter, Header, Query, Request
@@ -12,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from sharespace.core.file_manager import FileAccessError, MAX_FILE_SIZE_BYTES
 from sharespace.core.models import (
     PermissionLevel,
+    SearchResults,
     SharedDirectoryState,
     SharedDirectoryUpdate,
     TransferView,
@@ -68,6 +70,15 @@ def create_file_router(
     ):
         participant(authorization)
         return file_service.browse(path)
+
+    @router.get("/api/v1/files/search", response_model=SearchResults)
+    async def search_files(
+        q: str = Query(..., min_length=1, max_length=128),
+        limit: int = Query(default=200, ge=1, le=500),
+        authorization: str | None = Header(default=None),
+    ) -> SearchResults:
+        participant(authorization)
+        return await asyncio.to_thread(file_service.search, q, limit=limit)
 
     @router.get("/api/v1/files/info")
     async def file_info(

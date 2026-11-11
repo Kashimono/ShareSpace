@@ -274,6 +274,11 @@ class EventBroker:
         self._queues[queue] = None
         return queue
 
+    @property
+    def subscriber_count(self) -> int:
+        """Number of live event streams currently attached to this broker."""
+        return len(self._queues)
+
     def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
         self._queues.pop(queue, None)
 

@@ -1,4 +1,4 @@
-# Version 0.6.0 networking, monitoring, and security tests
+# Version 0.7.0 networking, search, persistence, and UI tests
 
 ## Run automated tests
 
@@ -9,12 +9,12 @@ Install the project with development dependencies and run:
 
 The project dependency set installs `watchdog`; monitoring and runtime sessions need
 no internet service. Current verification in this Windows development workspace:
-**83 passed, 2 skipped**. The two skips are existing filesystem symlink cases because
-symlink creation is unavailable in this environment. The suite reports one existing
+**105 passed, 3 skipped**. All three skips are symlink-dependent tests because
+symlink creation was unavailable in this environment. The suite reports one existing
 Starlette/HTTPX `TestClient` deprecation warning. In-process `TestClient` cases exercise
 API and authorization logic; they do not prove transport encryption. Embedded Uvicorn
 integration tests exercise HTTPS/WSS on loopback with production-style ephemeral
-certificates.
+certificates. The main-window startup test uses Qt's offscreen platform plugin.
 
 ## Automated coverage
 
@@ -41,6 +41,24 @@ certificates.
 - GUI/notification tests: affected-directory refresh hints and directory-deletion
   navigation recovery, HTML-safe in-app fallback, and duplicate notification
   suppression. Native OS notification delivery is mocked and is not verified here.
+- Search tests: exact/partial and case-insensitive Unicode names, folders and nested
+  trees, empty/no-result cases, bounded results, invalid queries, authentication,
+  relative-only metadata, hidden/temp/link filtering, and unavailable shared roots.
+- Browser tests: sorting, result-location navigation, breadcrumbs, relevant live
+  search refreshes, and the Qt startup surface. The test suite does not drive every
+  visual control through a real desktop window.
+- Local storage tests: schema setup, settings restart persistence, transfer status and
+  byte history, interrupted transfer/session recovery, duplicate prevention through
+  primary-key upserts, filtering, sorting, clearing while preserving active state,
+  and path-safe error summaries.
+- Session history tests: hosted server start/end lifecycle and participant history
+  creation only after WSS authentication. Storage tests cover failed and interrupted
+  outcomes; no credentials are written to history tables.
+- Settings and error tests: preference defaults and validation, theme palette changes,
+  and path-safe user-facing error messages. Settings persistence is covered; the
+  native folder picker has not been physically verified on Linux.
+- Connection retry tests: TLS-verification state, deduplicated transitions, bounded
+  backoff behavior, and the maximum consecutive failure count.
 - Discovery tests use fake Zeroconf records. Cross-platform metadata and hotspot
   adapters use unit tests and mocks; no real Wi-Fi adapter is exercised.
 
@@ -86,6 +104,19 @@ server listing is restored. Remove or disconnect the shared root and confirm the
 host and participant report it unavailable.
 10. Repeat with Windows hosting and Linux joining, then Linux hosting and Windows
 joining. Record firewall and adapter behavior separately from the automated results.
+11. Search for an exact filename, a partial case-insensitive name, a folder, and a
+    Unicode filename in nested directories. Confirm the result shows its relative
+    folder, opening its location preserves the selected shared root, and clearing the
+    search returns to the current browsed folder.
+12. Change sort order by name, size, modified time, and file type. Confirm folders
+    remain grouped before files and the host's directory contents are not modified.
+13. Open Settings, select a theme and download folder, restart ShareSpace, and confirm
+    both preferences persist. Complete an upload/download, close and restart the app,
+    then confirm local history remains. Verify hosted and joined session history have
+    the appropriate role and outcome and never reopens a prior session.
+14. Choose a local history retention period, confirm only terminal rows expire, and
+    clear each history from its screen. Confirm active transfers/sessions remain
+    intact and shared files are untouched.
 
 If discovery fails but local TCP is permitted, use manual address and port entry. If
 TLS verification fails, compare the newly presented fingerprint with the host through
@@ -114,7 +145,7 @@ this limitation.
 
 | Verification | Result |
 | --- | --- |
-| Automated suite | 83 passed, 2 skipped; one Starlette/HTTPX deprecation warning |
+| Automated suite | 105 passed, 3 skipped; one Starlette/HTTPX deprecation warning |
 | HTTP API and permission rules | In-process TestClient tests; application authorization verified, transport not covered by these cases |
 | TLS certificate/IP SAN and cleanup | Automated certificate tests |
 | HTTPS and WSS | Embedded Uvicorn loopback tests with ephemeral session certificates |
@@ -123,7 +154,11 @@ this limitation.
 | Filesystem watcher | Automated watchdog integration tests on the current Windows development host |
 | WSS event validation and upload commit | TLS loopback checks; uploaded file is visible before its one `FILE_CREATED` event |
 | Automatic browser updates | Qt-level event handling plus authenticated API refresh; no physical two-computer GUI run |
+| Search API and browser | Authenticated in-process API tests and Qt offscreen model tests; no large-directory performance benchmark |
+| SQLite persistence and recovery | Temporary database restart tests; OS-default data-directory behavior covered through Qt but not tested on Linux |
+| Settings/theme and main-window startup | Qt offscreen Windows tests; no physical Linux desktop test |
 | Native desktop notifications | OS support and failure paths are mocked; Windows/Linux notification delivery was not tested |
+| Cross-platform UI and folder picker | Qt abstractions used; only the current Windows test environment was exercised |
 | Windows/Linux physical communication | Not verified in this workspace |
 | mDNS multicast and firewall traversal | Not verified on physical devices |
 | Linux hotspot hardware | Not verified; adapter tests are mocked |
@@ -132,5 +167,7 @@ this limitation.
 Loopback TLS verifies local protocol integration. It does not establish that a
 physical Windows/Linux pair can communicate through a specific router or firewall.
 The self-signed fingerprint must be compared independently to authenticate the host.
-TLS is transport encryption only; Version 0.6 does not implement end-to-end
-encryption or persistent peer trust.
+TLS is transport encryption only; Version 0.7 does not implement end-to-end
+encryption or persistent peer trust. Linux runtime behavior, native notifications,
+physical Windows/Linux networking, multicast discovery, and hotspot hardware remain
+unverified in this workspace.

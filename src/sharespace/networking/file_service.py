@@ -21,9 +21,11 @@ CHUNK_SIZE = 64 * 1024
 class FileService:
     """Own file-sharing settings and file operations for one host session."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, history_store=None) -> None:
         self.directories = SharedDirectoryManager()
-        self.transfers = TransferManager()
+        self.transfers = TransferManager(
+            on_change=history_store.save_transfer if history_store is not None else None
+        )
         self._lock = threading.RLock()
         self.authorization_gate = asyncio.Lock()
         self._uploads_enabled = False
@@ -94,6 +96,9 @@ class FileService:
 
     def browse(self, relative_path: str = ""):
         return self.directories.listing(relative_path)
+
+    def search(self, query: str, *, limit: int = 200):
+        return self.directories.search(query, limit=limit)
 
     def start_download(self, relative_path: str, participant_id: str, transfer_id: str):
         path, descriptor = self.directories.safe_open(relative_path)

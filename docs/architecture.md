@@ -1,10 +1,11 @@
 # ShareSpace architecture
 
-Version 0.6.0 adds live shared-folder updates, participant activity events, and
-desktop notification fallbacks to the Version 0.5 permissions and security layer.
-It reuses the existing FastAPI/Uvicorn server, authenticated WSS endpoint, Qt UI, and
-separate Windows and Linux hotspot adapters. Monitoring and session traffic work
-offline; there is no public certificate authority or cloud dependency.
+Version 0.7.0 extends the existing Version 0.6 live-update and notification layer
+with authenticated tree search, a more capable participant browser, local transfer
+and session history, centralized application settings, clearer connection health,
+and path-safe error presentation. It reuses the existing FastAPI/Uvicorn server,
+authenticated WSS endpoint, Qt UI, and separate Windows and Linux hotspot adapters.
+All runtime functionality remains local and offline-first.
 
 ## Module boundaries
 
@@ -19,7 +20,8 @@ offline; there is no public certificate authority or cloud dependency.
 - `sharespace.core.file_manager.SharedDirectoryManager` owns the host-selected root,
   relative-path validation, hidden-item filtering, symlink/reparse rejection, and
   confinement checks. Its `root_available()` check also detects a removed or
-  replaced selected root.
+  replaced selected root. Tree search traverses only this root, returns safe relative
+  metadata, and never reads file contents.
 - `sharespace.core.file_monitor.FileMonitor` owns one watchdog observer and one
   bounded event worker. It schedules non-recursive watches for directories that the
   manager lists as permitted, then derives public file changes from safe directory
@@ -28,10 +30,34 @@ offline; there is no public certificate authority or cloud dependency.
   affected parent directories; directory topology changes and queue overflow use a
   full safe scan. Inaccessible subtrees retain their previous snapshot until access
   returns. Queue overflow produces a resync hint.
-- `sharespace.core.transfer_manager.TransferManager` tracks transfer state, byte
-  counts, cancellation, and bounded in-memory history. It stores no file content.
+- `sharespace.core.transfer_manager.TransferManager` remains authoritative for active
+  transfer state, byte counts, cancellation, and bounded in-memory views. Lifecycle
+  snapshots are sent to local history storage without storing file contents.
 - `sharespace.core.device_manager.DeviceManager` identifies the device and available
   local IPv4 addresses and selects the host address without hardcoding it.
+
+### Local application storage
+
+- `sharespace.storage.local_store.LocalStore` owns one thread-safe SQLite connection
+  for settings, transfer history, and session history. It uses Python's standard
+  `sqlite3`, parameterized statements, transactions, a schema version, and Qt's
+  platform-specific `AppLocalDataLocation`. The database is outside any shared root.
+- The `settings` table stores JSON values for theme, notification preferences,
+  download destination, and history retention. No session credentials or network
+  security settings are stored there.
+- `transfer_history` stores transfer IDs, filename, direction, size, transferred
+  bytes, status, timestamps, a sanitized error summary, and a participant identifier
+  when relevant. The ID is the primary key, so repeated lifecycle snapshots update
+  one row. Active snapshots are written at start and at 1 MiB progress intervals;
+  terminal states are written after the transfer manager decides the outcome.
+- `session_history` stores the local role, session name/ID, host device, timestamps,
+  duration, participant count, and final outcome. A row starts as local `ACTIVE` while
+  the live session is running; history views exclude that state. On application
+  startup, unfinished transfer and session rows are finalized as `INTERRUPTED`.
+- Startup applies the selected retention period (30, 90, or 365 days, or unlimited)
+  only to terminal history. Manual clearing also preserves active state and never
+  removes shared files. Database errors are logged and surfaced; if persistent storage
+  cannot be opened, the application can continue with an in-memory fallback.
 
 ### Local networking
 
@@ -52,13 +78,17 @@ offline; there is no public certificate authority or cloud dependency.
 - `sharespace.networking.session_client.SessionClient` reuses a thread-safe HTTPX
   connection pool for HTTPS API requests and uses the same pin for WSS, approval,
   host controls, heartbeat events, and file-service control requests.
+  The live event client distinguishes TLS verification from WebSocket setup and
+  authentication, retries with delays capped at ten seconds, and stops after twelve
+  consecutive failed attempts.
 - `sharespace.networking.discovery.SessionAdvertiser` publishes public metadata on
   `_sharespace._tcp.local.` using protocol version 2. Discovery includes the
   fingerprint so the participant can compare it, but mDNS is not an independent
   trusted channel.
 - `sharespace.networking.file_routes` authenticates every file operation. Browsing,
   metadata, and download require a currently connected participant. Upload additionally
-  requires `READ_WRITE` and the host's global upload switch.
+  requires `READ_WRITE` and the host's global upload switch. Search uses the same
+  connected-participant authentication and shared-root checks.
 - `sharespace.networking.file_service.FileService` streams 64 KiB chunks. Its async
   authorization gate serializes permission changes, host upload toggles, participant
   disconnects, root changes, chunk writes, and final file publication. It cancels
@@ -74,25 +104,37 @@ offline; there is no public certificate authority or cloud dependency.
   publication is visible in a manager listing, with no synthetic upload event.
 - `sharespace.networking.file_client.FileClient` verifies the pinned certificate for
   file operations, streams without loading whole files into memory, and creates local
-  download files without overwriting an existing destination.
+  download files without overwriting an existing destination. Search and transfer
+  network calls are used from Qt worker threads.
 
 ### Qt presentation
 
 - `HostSessionDialog` preserves the existing hotspot and network choices.
 - `SessionHostDialog` shows the security status, negotiated TLS version, session
   fingerprint, requests, participant roles/status/permission, global upload setting,
-  and transfer state. The host can copy the fingerprint, grant/revoke `READ_WRITE`,
-  disconnect participants, and stop sharing. Its activity line and notifications
-  update on file and participant events.
+  and transfer state. A health line reports server/session state, connected peers,
+  shared-root availability, file-monitor status, event streams, and active transfers.
+  The host can copy the fingerprint, grant/revoke `READ_WRITE`, disconnect
+  participants, and stop sharing. Its activity line and notifications update on file
+  and participant events.
 - `SessionJoinDialog` shows the expected fingerprint. It requires the participant to
   affirm an independent trusted-channel comparison before verification and before the
   joining code is sent. TLS errors and replacement fingerprints are surfaced to the
   participant.
 - `FileBrowserDialog` keeps browsing and downloading available to `READ_ONLY`
   participants. Upload controls require both `READ_WRITE` and the globally enabled
-  upload state. It refreshes only affected paths through the authenticated API when
-  file or directory events arrive and refetches the current listing after reconnect
-  or a resync hint.
+  upload state. It has debounced, background tree search, breadcrumb and parent
+  navigation, result-location navigation, sorting, metadata formatting, empty/loading
+  states, a three-transfer UI limit, and a default local download destination. File
+  and directory events refresh the current listing or matching search results through
+  the authenticated API; reconnect and resync hints recover the server-owned listing.
+- `HistoryDialog` shows local transfer or session metadata with filters and sorting.
+  It never turns an old session into an active or joinable session. `SettingsDialog`
+  edits local theme, notification, destination, and retention preferences.
+- `sharespace.ui.error_messages` maps common network, filesystem, TLS, storage, and
+  transfer errors to concise messages and removes local paths and credentials from
+  generic error text. Background workers log diagnostic exceptions and emit a safe
+  user-facing message.
 - `sharespace.ui.notification_manager.NotificationManager` requests a Qt system-tray
   notification when available and otherwise shows a short in-app banner. Native
   delivery depends on the platform and user notification settings; automated checks
@@ -109,6 +151,30 @@ filesystem integration was run on Windows in this workspace; Linux watcher behav
 has not been run here.
 
 ## Session, permission, and trust flow
+
+### Local metadata lifecycle
+
+`SessionServer` writes a host session record only after Uvicorn reports ready; the
+participant UI writes a joined-session record only after the WSS authentication
+response. Session shutdown, a participant disconnect, a failed join/start, or startup
+recovery finalizes the relevant local record. Failed attempts can be shown as `FAILED`
+but never as completed live sessions.
+
+The existing `TransferManager` controls each transfer. A client-side download is marked
+complete only after the no-overwrite destination finalization succeeds. A host upload
+is marked complete only after the service atomically publishes the file. Failed and
+cancelled states are recorded separately; app startup marks any still-active persisted
+transfer `INTERRUPTED` and does not restart it.
+
+### File search
+
+`GET /api/v1/files/search?q=...&limit=...` scans filenames and folder names inside the
+selected shared root. The authenticated route offloads the scan from the ASGI event
+loop. The scanner skips hidden entries, symlinks, Windows reparse points, temporary
+upload files, and non-regular items. It returns at most 500 metadata records per
+request (the UI asks for 200) and marks truncated results. Names are case-folded for
+matching. No content index, file read, absolute path, or participant-supplied path
+resolution is involved.
 
 ```mermaid
 sequenceDiagram
@@ -199,6 +265,7 @@ session certificate.
 | `POST /api/v1/host/files/transfers/{transfer_id}/cancel` | Cancel any transfer | Host bearer token, HTTPS |
 | `GET /api/v1/files/settings` | Read shared folder name and permission | Connected participant token, HTTPS |
 | `GET /api/v1/files?path=...` | Browse relative directory | Connected participant token, HTTPS |
+| `GET /api/v1/files/search?q=...&limit=...` | Search visible filenames and folders under the shared root | Connected participant token, HTTPS |
 | `GET /api/v1/files/info?path=...` | Read file metadata | Connected participant token, HTTPS |
 | `GET /api/v1/files/download?path=...` | Download a file up to 20 MB | Connected participant token, HTTPS |
 | `POST /api/v1/files/upload?path=...` | Upload a new file | Connected token, `READ_WRITE`, global uploads enabled, HTTPS |
@@ -240,9 +307,12 @@ the existing no-overwrite atomic publication completes.
   temporary-directory ACL; this development build does not set a custom Windows ACL.
 - Certificates are valid for 30 days but are removed with the session. There is no
   persistent trust store; clients must compare a new fingerprint for a new session.
-- Session data, authentication digests, and transfer history are in memory. The app
-  disables Uvicorn access logs, logs authorization failure codes without request
-  bodies, and avoids logging credential values.
+- Active session state, authentication digests, and active transfer state remain in
+  memory. User preferences and finalized/recoverable transfer and session metadata
+  are stored locally in SQLite. The database contains no credentials, private keys,
+  file contents, or absolute host shared-directory paths. The app disables Uvicorn
+  access logs, logs authorization failure codes without request bodies, and avoids
+  logging credential values.
 - Files are limited to 20,000,000 bytes, transferred in 64 KiB chunks. Uploads use a
   same-directory temporary file and atomic no-overwrite publication. Symbolic links
   and reparse points are not followed, hidden entries are not served, and the selected
@@ -254,10 +324,18 @@ the existing no-overwrite atomic publication completes.
 - The watcher uses a 250 ms quiet interval and a 4,096-entry pending-event queue.
   No benchmark was run. A large directory move or overflow causes a recursive safe
   metadata scan; ordinary file changes inspect only their affected parent folders.
-  Actual OS tray notification delivery and Linux filesystem observer behavior need
-  platform testing.
+  Search performs a full metadata scan on demand after a 300 ms UI debounce; it runs
+  outside the GUI and returns at most 200 rows by default. It may take longer on very
+  large trees because no index is built. Actual OS tray notification delivery and
+  Linux filesystem observer behavior need platform testing.
+- The current automated run was performed on Windows with Python 3.11: 103 tests
+  passed and 3 symlink-dependent tests skipped because symlink creation was unavailable.
+  One existing Starlette/HTTPX TestClient deprecation warning remains. The Qt main
+  window startup test uses the offscreen platform plugin. Linux startup and filesystem
+  monitoring, physical cross-platform network communication, and native notifications
+  have not been verified here.
 
 The implementation preserves the Version 0.4 file size limit and file operations.
 Participants still cannot delete or rename files or create directories. File
 synchronization, automatic transfer, persistent event/notification history, cloud
-services, and end-to-end encryption are outside Version 0.6.
+services, and end-to-end encryption remain outside Version 0.7.

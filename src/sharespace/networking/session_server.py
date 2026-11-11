@@ -89,12 +89,14 @@ def create_session_app(
 
     app = FastAPI(
         title="ShareSpace Local Session API",
-        version="0.6.0",
+        version="0.7.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
         lifespan=lifespan,
     )
+    app.state.file_event_coordinator = file_events
+    app.state.event_broker = broker
     app.state.session_manager = manager
     app.state.event_broker = broker
     app.state.file_service = files
@@ -421,9 +423,10 @@ class SessionServer:
         *,
         ready_timeout: float = 10.0,
         certificate_manager: SessionCertificateManager | None = None,
+        history_store=None,
     ) -> None:
         self.manager = manager or SessionManager()
-        self.file_service = FileService()
+        self.file_service = FileService(history_store=history_store)
         self.certificate_manager = certificate_manager or SessionCertificateManager()
         self.ready_timeout = ready_timeout
         self._server: uvicorn.Server | None = None
@@ -431,6 +434,9 @@ class SessionServer:
         self._thread: threading.Thread | None = None
         self._host_token: str | None = None
         self._port: int | None = None
+        self._app: FastAPI | None = None
+        self._history_store = history_store
+        self.history_record_id: str | None = None
 
     @property
     def port(self) -> int | None:
@@ -439,6 +445,20 @@ class SessionServer:
     @property
     def host_token(self) -> str | None:
         return self._host_token
+
+    @property
+    def server_running(self) -> bool:
+        return bool(self._thread is not None and self._thread.is_alive())
+
+    @property
+    def file_monitor_running(self) -> bool:
+        coordinator = getattr(self._app.state, "file_event_coordinator", None) if self._app else None
+        return bool(coordinator is not None and coordinator.monitor.running)
+
+    @property
+    def event_stream_count(self) -> int:
+        broker = getattr(self._app.state, "event_broker", None) if self._app else None
+        return int(broker.subscriber_count) if broker is not None else 0
 
     def start(
         self,
@@ -472,9 +492,10 @@ class SessionServer:
                 port=port,
                 certificate_fingerprint=certificate.fingerprint,
             )
+            app = create_session_app(self.manager, file_service=self.file_service)
             server = uvicorn.Server(
                 uvicorn.Config(
-                    create_session_app(self.manager, file_service=self.file_service),
+                    app,
                     host="0.0.0.0",
                     port=port,
                     log_level="warning",
@@ -494,6 +515,7 @@ class SessionServer:
             )
             self._socket = bind_socket
             self._server = server
+            self._app = app
             self._thread = thread
             self._port = port
             self._host_token = credentials.host_token
@@ -505,6 +527,18 @@ class SessionServer:
                 self.stop()
                 self.manager.end_session(credentials.host_token)
                 raise RuntimeError("The local session server did not start.")
+            if self._history_store is not None:
+                try:
+                    self.history_record_id = self._history_store.start_session(
+                        session_id=session.session_id,
+                        session_name=session.session_name,
+                        host_device_name=session.host_device_name,
+                        role="HOST",
+                        started_at=session.created_at,
+                        participant_count=max(0, session.participant_count - 1),
+                    )
+                except Exception:
+                    logger.exception("Could not save hosted session history.")
             return session, credentials.joining_code, credentials.host_token
         except Exception as error:
             logger.error("Local TLS session startup failed (%s).", type(error).__name__)
@@ -523,16 +557,27 @@ class SessionServer:
         """Ask Uvicorn to stop and release its listening socket."""
         if self._server is not None:
             self._server.should_exit = True
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=5)
-        if self._thread is not None and self._thread.is_alive():
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+        if thread is not None and thread.is_alive():
             logger.error("Session server did not stop within the cleanup timeout.")
-        elif self._socket is not None:
+            # Retain references and sensitive runtime resources so cleanup can be
+            # retried; dropping them here would orphan a live server thread.
+            return
+        if self._socket is not None:
             with contextlib.suppress(OSError):
                 self._socket.close()
             self._socket = None
         self._server = None
+        self._app = None
         self._thread = None
+        if self.history_record_id is not None and self._history_store is not None:
+            try:
+                self._history_store.finish_session(self.history_record_id, "COMPLETED")
+            except Exception:
+                logger.exception("Could not finalize hosted session history.")
+            self.history_record_id = None
         self._port = None
         self._host_token = None
         self.file_service.stop_sharing()

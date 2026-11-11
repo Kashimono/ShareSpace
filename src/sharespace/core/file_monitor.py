@@ -93,6 +93,16 @@ class FileMonitor:
         with self._lock:
             return self._generation
 
+    @property
+    def running(self) -> bool:
+        """Whether the metadata worker and platform observer are both alive."""
+        with self._lock:
+            observer, worker = self._observer, self._worker
+        return bool(
+            observer is not None and observer.is_alive()
+            and worker is not None and worker.is_alive()
+        )
+
     def set_root(self, root: Path | None) -> int:
         """Replace the monitored root, shutting down its old observer first."""
         self.stop()

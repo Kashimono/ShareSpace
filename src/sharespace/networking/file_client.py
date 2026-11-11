@@ -14,7 +14,9 @@ from pathlib import Path
 import httpx
 
 from sharespace.core.file_manager import MAX_FILE_SIZE_BYTES
-from sharespace.core.models import DirectoryListing, SharedDirectoryState, TransferDirection, TransferView
+from sharespace.core.models import (
+    DirectoryListing, SearchResults, SharedDirectoryState, TransferDirection, TransferView,
+)
 from sharespace.core.transfer_manager import TransferCancelled, TransferManager
 from sharespace.networking.session_server import API_PREFIX
 from sharespace.networking.tls_security import (
@@ -43,6 +45,7 @@ class FileClient:
         security: TLSConnectionSecurity | None = None,
         certificate_fingerprint: str | None = None,
         timeout_seconds: float = 15.0,
+        history_store=None,
     ) -> None:
         if security is None:
             if certificate_fingerprint is None:
@@ -56,7 +59,9 @@ class FileClient:
         self.base_url = f"https://{host}:{port}{API_PREFIX}"
         self.token = token
         self.timeout_seconds = timeout_seconds
-        self.transfers = TransferManager()
+        self.transfers = TransferManager(
+            on_change=history_store.save_transfer if history_store is not None else None
+        )
         self._http_client: httpx.Client | None = None
         self._http_client_lock = threading.Lock()
 
@@ -76,6 +81,11 @@ class FileClient:
     async def browse(self, relative_path: str = "") -> DirectoryListing:
         return DirectoryListing.model_validate(
             await self._json("GET", "/files", params={"path": relative_path})
+        )
+
+    async def search(self, query: str, *, limit: int = 200) -> SearchResults:
+        return SearchResults.model_validate(
+            await self._json("GET", "/files/search", params={"q": query, "limit": limit})
         )
 
     async def transfers_list(self) -> list[TransferView]:

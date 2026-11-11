@@ -24,9 +24,11 @@ class NotificationManager:
         layout: QVBoxLayout,
         *,
         native_owner: NotificationManager | None = None,
+        preferences: dict[str, bool] | None = None,
     ) -> None:
         self.parent = parent
         self._native_owner = native_owner
+        self._preferences = preferences or {}
         self._banner = QLabel(parent)
         self._banner.setWordWrap(True)
         self._banner.setStyleSheet(
@@ -42,8 +44,13 @@ class NotificationManager:
         self._recent_ids: deque[str] = deque(maxlen=1024)
         self._recent_set: set[str] = set()
 
-    def notify(self, title: str, message: str, *, event_id: str | None = None) -> bool:
+    def notify(
+        self, title: str, message: str, *, event_id: str | None = None,
+        category: str = "general",
+    ) -> bool:
         """Show a unique notification; return whether native display was requested."""
+        if self._preferences.get(category, True) is False:
+            return False
         if event_id is not None:
             if event_id in self._recent_set:
                 return False

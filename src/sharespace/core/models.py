@@ -55,6 +55,7 @@ class TransferStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    INTERRUPTED = "INTERRUPTED"
 
 
 class PublicSession(BaseModel):
@@ -185,6 +186,14 @@ class DirectoryListing(BaseModel):
     parent_path: str | None
     shared_directory_name: str
     items: list[FileItem]
+
+
+class SearchResults(BaseModel):
+    """Safe metadata-only results from searching a shared directory tree."""
+
+    query: str
+    results: list[FileItem]
+    truncated: bool = False
 
 
 class SharedDirectoryState(BaseModel):
