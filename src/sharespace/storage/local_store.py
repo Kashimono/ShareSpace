@@ -14,6 +14,7 @@ import re
 import sqlite3
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from sharespace.core.models import TransferView
 
 logger = logging.getLogger(__name__)
 _SCHEMA_VERSION = 1
+_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}
 _ACTIVE_TRANSFER_STATUSES = ("QUEUED", "IN_PROGRESS")
 _SESSION_OUTCOMES = {"COMPLETED", "DISCONNECTED", "INTERRUPTED", "FAILED"}
 _SECRET_PATTERN = re.compile(r"(?i)(bearer\s+\S+|joining code\s*[:=]\s*\S+|token\s*[:=]\s*\S+)")
@@ -82,11 +84,15 @@ class LocalStore:
             str(selected_path), timeout=5.0, check_same_thread=False
         )
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA busy_timeout = 5000")
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        if self.persistent:
-            self._connection.execute("PRAGMA journal_mode = WAL")
-        self._migrate()
+        try:
+            self._connection.execute("PRAGMA busy_timeout = 5000")
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            if self.persistent:
+                self._connection.execute("PRAGMA journal_mode = WAL")
+            self._migrate()
+        except Exception:
+            self._connection.close()
+            raise
         if self.persistent and os.name != "nt":
             try:
                 self.path.chmod(0o600)
@@ -96,56 +102,115 @@ class LocalStore:
     def _migrate(self) -> None:
         with self._lock:
             version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+            self._validate_database()
             if version > _SCHEMA_VERSION:
                 raise sqlite3.DatabaseError("The local data schema is newer than this application.")
             if version == _SCHEMA_VERSION:
                 return
+            if version == 0:
+                tables = self._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+                if tables:
+                    raise sqlite3.DatabaseError(
+                        "The local data database has an unrecognized schema; it was left unchanged."
+                    )
+                self._create_initial_schema()
+                return
+            for target_version in range(version + 1, _SCHEMA_VERSION + 1):
+                migration = _MIGRATIONS.get(target_version)
+                if migration is None:
+                    raise sqlite3.DatabaseError(
+                        f"No safe migration is available for local data schema {target_version}."
+                    )
+                self._backup_before_migration()
+                try:
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    migration(self._connection)
+                    self._connection.execute(f"PRAGMA user_version = {target_version}")
+                    self._connection.commit()
+                except Exception:
+                    self._connection.rollback()
+                    raise
+
+    def _validate_database(self) -> None:
+        results = self._connection.execute("PRAGMA quick_check").fetchall()
+        if len(results) != 1 or str(results[0][0]).casefold() != "ok":
+            raise sqlite3.DatabaseError("The local data database failed its integrity check.")
+
+    def _backup_before_migration(self) -> None:
+        if not self.persistent:
+            return
+        backup_path = self.path.with_suffix(self.path.suffix + ".backup")
+        temporary_path = backup_path.with_name(f"{backup_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            destination = sqlite3.connect(str(temporary_path))
             try:
-                self._connection.executescript(
-                    """
-                    BEGIN IMMEDIATE;
-                    CREATE TABLE IF NOT EXISTS settings (
-                        key TEXT PRIMARY KEY,
-                        value_json TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    );
-                    CREATE TABLE IF NOT EXISTS transfer_history (
-                        transfer_id TEXT PRIMARY KEY,
-                        filename TEXT NOT NULL,
-                        direction TEXT NOT NULL CHECK(direction IN ('UPLOAD', 'DOWNLOAD')),
-                        file_size INTEGER NOT NULL CHECK(file_size >= 0),
-                        transferred_bytes INTEGER NOT NULL CHECK(transferred_bytes >= 0),
-                        status TEXT NOT NULL CHECK(status IN
-                            ('QUEUED', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED')),
-                        started_at TEXT NOT NULL,
-                        completed_at TEXT,
-                        error_summary TEXT,
-                        participant_identifier TEXT
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_transfer_history_date
-                        ON transfer_history(started_at DESC);
-                    CREATE TABLE IF NOT EXISTS session_history (
-                        record_id TEXT PRIMARY KEY,
-                        session_id TEXT,
-                        session_name TEXT,
-                        host_device_name TEXT NOT NULL,
-                        role TEXT NOT NULL CHECK(role IN ('HOST', 'PARTICIPANT')),
-                        started_at TEXT NOT NULL,
-                        ended_at TEXT,
-                        duration_seconds INTEGER,
-                        participant_count INTEGER,
-                        outcome TEXT CHECK(outcome IS NULL OR outcome IN
-                            ('ACTIVE', 'COMPLETED', 'DISCONNECTED', 'INTERRUPTED', 'FAILED'))
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_session_history_date
-                        ON session_history(started_at DESC);
-                    """
-                )
-                self._connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-                self._connection.commit()
-            except sqlite3.DatabaseError:
-                self._connection.rollback()
-                raise
+                self._connection.backup(destination)
+            finally:
+                destination.close()
+            if os.name != "nt":
+                temporary_path.chmod(0o600)
+            os.replace(temporary_path, backup_path)
+            if os.name != "nt":
+                backup_path.chmod(0o600)
+        except Exception as error:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Could not remove a failed temporary database backup.")
+            raise sqlite3.DatabaseError(
+                "Could not preserve a backup before the local data migration."
+            ) from error
+
+    def _create_initial_schema(self) -> None:
+        try:
+            self._connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS transfer_history (
+                    transfer_id TEXT PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    direction TEXT NOT NULL CHECK(direction IN ('UPLOAD', 'DOWNLOAD')),
+                    file_size INTEGER NOT NULL CHECK(file_size >= 0),
+                    transferred_bytes INTEGER NOT NULL CHECK(transferred_bytes >= 0),
+                    status TEXT NOT NULL CHECK(status IN
+                        ('QUEUED', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED')),
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    error_summary TEXT,
+                    participant_identifier TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_transfer_history_date
+                    ON transfer_history(started_at DESC);
+                CREATE TABLE IF NOT EXISTS session_history (
+                    record_id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    session_name TEXT,
+                    host_device_name TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('HOST', 'PARTICIPANT')),
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    duration_seconds INTEGER,
+                    participant_count INTEGER,
+                    outcome TEXT CHECK(outcome IS NULL OR outcome IN
+                        ('ACTIVE', 'COMPLETED', 'DISCONNECTED', 'INTERRUPTED', 'FAILED'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_history_date
+                    ON session_history(started_at DESC);
+                """
+            )
+            self._connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
 
     def get_setting(self, key: str, default: Any = None) -> Any:
         with self._lock:

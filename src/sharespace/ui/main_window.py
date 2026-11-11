@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPalette
+from PySide6.QtGui import QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -18,10 +18,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sharespace import __version__
 from sharespace.platform.platform_manager import PlatformManager
 from sharespace.ui.host_session_dialog import HostSessionDialog
 from sharespace.ui.app_settings import apply_theme, load_preferences
 from sharespace.ui.history_dialog import HistoryDialog
+from sharespace.ui.resources import resource_path
 from sharespace.ui.settings_dialog import SettingsDialog
 
 
@@ -33,6 +35,7 @@ class MainWindow(QMainWindow):
         preferences: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
+        self.setWindowIcon(QIcon(str(resource_path("sharespace.png"))))
         self._platform_manager = platform_manager
         self._store = store
         self._preferences = preferences or (load_preferences(store) if store is not None else {})
@@ -40,7 +43,7 @@ class MainWindow(QMainWindow):
             application = QApplication.instance()
             if application is not None:
                 apply_theme(application, str(self._preferences.get("theme", "system")))
-        self.setWindowTitle("ShareSpace")
+        self.setWindowTitle(f"ShareSpace {__version__}")
         self.setMinimumSize(680, 440)
         self.resize(840, 540)
         self._apply_window_style()

@@ -26,6 +26,14 @@ logger = logging.getLogger(__name__)
 MAX_EVENT_RECONNECT_ATTEMPTS = 12
 
 
+async def _wait_for_retry_or_stop(stop_event: threading.Event, delay: float) -> None:
+    """Wait for backoff or shutdown without making window closure wait for it."""
+    try:
+        await asyncio.wait_for(asyncio.to_thread(stop_event.wait), timeout=delay)
+    except TimeoutError:
+        pass
+
+
 class SessionClientError(RuntimeError):
     """A session request failed or returned an invalid response."""
 
@@ -236,7 +244,7 @@ class SessionClient:
                 if attempts >= MAX_EVENT_RECONNECT_ATTEMPTS:
                     emit_state("host_unavailable")
                     return
-                await asyncio.sleep(retry_delay)
+                await _wait_for_retry_or_stop(stop_event, retry_delay)
                 retry_delay = min(retry_delay * 2, 10.0)
         emit_state("stopped")
 

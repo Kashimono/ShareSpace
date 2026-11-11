@@ -6,6 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
+from sharespace import __version__
 from sharespace.storage.local_store import LocalStore
 from sharespace.ui.app_settings import load_preferences
 from sharespace.ui.main_window import MainWindow
@@ -21,5 +22,8 @@ def test_main_window_starts_with_settings_and_history_actions(tmp_path):
     assert window._settings_button.isEnabled()
     assert window._transfer_history_button.isEnabled()
     assert window._session_history_button.isEnabled()
+    assert __version__ == "1.0.0"
+    assert window.windowTitle() == "ShareSpace 1.0.0"
+    assert not window.windowIcon().isNull()
     window.close()
     store.close()

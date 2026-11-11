@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import sqlite3
+
+import pytest
+
 from sharespace.core.models import TransferDirection, TransferStatus
 from sharespace.core.transfer_manager import TransferManager
+import sharespace.storage.local_store as local_store_module
 from sharespace.storage.local_store import LocalStore
 
 
@@ -128,3 +133,44 @@ def test_failed_cancelled_and_failed_session_records_are_kept(tmp_path):
     assert {row["status"] for row in records} == {"FAILED", "CANCELLED"}
     assert store.session_records(role="PARTICIPANT")[0]["outcome"] == "FAILED"
     store.close()
+
+
+def test_failed_future_migration_keeps_database_and_pre_migration_backup(tmp_path, monkeypatch):
+    database = tmp_path / "sharespace.sqlite3"
+    store = LocalStore(database)
+    store.set_setting("theme", "dark")
+    store.close()
+
+    def failing_migration(connection):
+        connection.execute("CREATE TABLE migration_probe(value TEXT)")
+        raise sqlite3.DatabaseError("simulated migration failure")
+
+    monkeypatch.setattr(local_store_module, "_SCHEMA_VERSION", 2)
+    monkeypatch.setitem(local_store_module._MIGRATIONS, 2, failing_migration)
+    with pytest.raises(sqlite3.DatabaseError, match="simulated migration failure"):
+        LocalStore(database)
+
+    backup = database.with_suffix(database.suffix + ".backup")
+    assert backup.is_file()
+    for candidate in (database, backup):
+        with sqlite3.connect(candidate) as connection:
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+            assert connection.execute(
+                "SELECT value_json FROM settings WHERE key = 'theme'"
+            ).fetchone()[0] == '"dark"'
+            assert connection.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'migration_probe'"
+            ).fetchone() is None
+
+
+def test_unversioned_database_with_existing_tables_is_not_reset(tmp_path):
+    database = tmp_path / "sharespace.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE custom_data(value TEXT)")
+        connection.execute("INSERT INTO custom_data VALUES ('preserve')")
+
+    with pytest.raises(sqlite3.DatabaseError, match="unrecognized schema"):
+        LocalStore(database)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT value FROM custom_data").fetchone() == ("preserve",)

@@ -1,0 +1,49 @@
+name: Native release builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }} package
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows
+            runner: windows-2022
+          - target: linux
+            runner: ubuntu-22.04
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            packaging/release-constraints.txt
+      - name: Install release dependencies
+        run: python -m pip install -e ".[dev,build]" -c packaging/release-constraints.txt
+      - name: Run automated suite
+        run: python -m pytest -q
+      - name: Build, smoke-test, and package
+        run: python packaging/build_release.py --target ${{ matrix.target }}
+      - name: Keep package and checksum as workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ShareSpace-${{ matrix.target }}-candidate
+          path: release-artifacts/ShareSpace-*
+          if-no-files-found: error
+          retention-days: 30

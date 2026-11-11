@@ -1,11 +1,11 @@
 # ShareSpace architecture
 
-Version 0.7.0 extends the existing Version 0.6 live-update and notification layer
-with authenticated tree search, a more capable participant browser, local transfer
-and session history, centralized application settings, clearer connection health,
-and path-safe error presentation. It reuses the existing FastAPI/Uvicorn server,
-authenticated WSS endpoint, Qt UI, and separate Windows and Linux hotspot adapters.
-All runtime functionality remains local and offline-first.
+Version 1.0.0 packages the existing local networking, session management, permissions,
+file transfers, live updates, local history, and settings as native Windows and Linux
+applications. It adds startup diagnostics, safe database migration hooks, and
+per-user installation without changing the shared application logic or merging the
+platform-specific hotspot adapters. Runtime functionality remains local and
+offline-first.
 
 ## Module boundaries
 
@@ -58,6 +58,24 @@ All runtime functionality remains local and offline-first.
   only to terminal history. Manual clearing also preserves active state and never
   removes shared files. Database errors are logged and surfaced; if persistent storage
   cannot be opened, the application can continue with an in-memory fallback.
+
+### Release packaging
+
+- `sharespace.__version__` is the single source for package metadata, the window title,
+  API metadata, Windows file properties, and archive names.
+- `sharespace.ui.resources.resource_path` resolves icons from the source tree or
+  PyInstaller's bundle directory without relying on the current working directory.
+- `packaging/build_release.py` creates a native one-directory PyInstaller bundle,
+  runs an isolated startup smoke test, exercises install/upgrade/uninstall, checks the
+  payload for local data and key material, writes third-party notices, and generates
+  an archive with a SHA-256 checksum.
+- Windows and Linux installer scripts use per-user locations and a ShareSpace marker
+  before replacing/removing installed files. They preserve application data on
+  uninstall. Windows hotspot creation is unavailable in this classic package because
+  the OS API requires package identity/capabilities.
+- `.github/workflows/release-build.yml` builds on native Windows and Ubuntu runners
+  and retains candidate archives as workflow artifacts. It does not publish a public
+  release.
 
 ### Local networking
 
@@ -311,8 +329,8 @@ the existing no-overwrite atomic publication completes.
   memory. User preferences and finalized/recoverable transfer and session metadata
   are stored locally in SQLite. The database contains no credentials, private keys,
   file contents, or absolute host shared-directory paths. The app disables Uvicorn
-  access logs, logs authorization failure codes without request bodies, and avoids
-  logging credential values.
+  access logs, logs authorization failure codes without request bodies, redacts
+  common credential formats from application logs, and avoids logging credentials.
 - Files are limited to 20,000,000 bytes, transferred in 64 KiB chunks. Uploads use a
   same-directory temporary file and atomic no-overwrite publication. Symbolic links
   and reparse points are not followed, hidden entries are not served, and the selected
@@ -328,14 +346,12 @@ the existing no-overwrite atomic publication completes.
   outside the GUI and returns at most 200 rows by default. It may take longer on very
   large trees because no index is built. Actual OS tray notification delivery and
   Linux filesystem observer behavior need platform testing.
-- The current automated run was performed on Windows with Python 3.11: 103 tests
-  passed and 3 symlink-dependent tests skipped because symlink creation was unavailable.
-  One existing Starlette/HTTPX TestClient deprecation warning remains. The Qt main
-  window startup test uses the offscreen platform plugin. Linux startup and filesystem
-  monitoring, physical cross-platform network communication, and native notifications
-  have not been verified here.
+- The current automated and packaging results are recorded in
+  `docs/networking-tests.md`. Windows workspace tests use Python 3.11 and the Qt
+  offscreen plugin. Linux package behavior, physical cross-platform networking, and
+  native notifications must be recorded separately from mocked or loopback results.
 
 The implementation preserves the Version 0.4 file size limit and file operations.
 Participants still cannot delete or rename files or create directories. File
 synchronization, automatic transfer, persistent event/notification history, cloud
-services, and end-to-end encryption remain outside Version 0.7.
+services, and end-to-end encryption remain outside Version 1.0.0.

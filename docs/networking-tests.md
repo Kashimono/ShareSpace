@@ -1,4 +1,4 @@
-# Version 0.7.0 networking, search, persistence, and UI tests
+# Version 1.0.0 release candidate verification
 
 ## Run automated tests
 
@@ -8,10 +8,8 @@ Install the project with development dependencies and run:
     python -m pytest -q
 
 The project dependency set installs `watchdog`; monitoring and runtime sessions need
-no internet service. Current verification in this Windows development workspace:
-**105 passed, 3 skipped**. All three skips are symlink-dependent tests because
-symlink creation was unavailable in this environment. The suite reports one existing
-Starlette/HTTPX `TestClient` deprecation warning. In-process `TestClient` cases exercise
+no internet service. Exact suite and packaging results for this candidate are listed
+in the verification table below. In-process `TestClient` cases exercise
 API and authorization logic; they do not prove transport encryption. Embedded Uvicorn
 integration tests exercise HTTPS/WSS on loopback with production-style ephemeral
 certificates. The main-window startup test uses Qt's offscreen platform plugin.
@@ -50,7 +48,8 @@ certificates. The main-window startup test uses Qt's offscreen platform plugin.
 - Local storage tests: schema setup, settings restart persistence, transfer status and
   byte history, interrupted transfer/session recovery, duplicate prevention through
   primary-key upserts, filtering, sorting, clearing while preserving active state,
-  and path-safe error summaries.
+  path-safe error summaries, failed migration rollback/backup, and refusal of unknown
+  unversioned databases.
 - Session history tests: hosted server start/end lifecycle and participant history
   creation only after WSS authentication. Storage tests cover failed and interrupted
   outcomes; no credentials are written to history tables.
@@ -58,7 +57,10 @@ certificates. The main-window startup test uses Qt's offscreen platform plugin.
   and path-safe user-facing error messages. Settings persistence is covered; the
   native folder picker has not been physically verified on Linux.
 - Connection retry tests: TLS-verification state, deduplicated transitions, bounded
-  backoff behavior, and the maximum consecutive failure count.
+  backoff behavior, maximum consecutive failure count, and prompt shutdown while
+  waiting between reconnect attempts.
+- Release tests: version/resource metadata, packaged startup smoke mode, and
+  credential redaction in persistent diagnostic logs.
 - Discovery tests use fake Zeroconf records. Cross-platform metadata and hotspot
   adapters use unit tests and mocks; no real Wi-Fi adapter is exercised.
 
@@ -135,9 +137,9 @@ verified on hardware.
 
 ### Windows
 
-The current unpackaged development installation lacks the required `wiFiControl`
-package identity/capability, and the Windows tethering API also needs a connection
-profile. The existing adapter reports hotspot control unavailable in this build.
+The classic Windows desktop package lacks the required `wiFiControl` package
+identity/capability, and the Windows tethering API also needs a connection profile.
+The existing adapter reports hotspot control unavailable in this build.
 Hosting over an existing Wi-Fi or wired LAN remains available and is independent of
 this limitation.
 
@@ -145,7 +147,12 @@ this limitation.
 
 | Verification | Result |
 | --- | --- |
-| Automated suite | 105 passed, 3 skipped; one Starlette/HTTPX deprecation warning |
+| Automated suite | 113 passed, 3 skipped; one Starlette `TestClient` deprecation warning |
+| Skipped tests | Three symlink tests skipped because symlink creation is unavailable in this environment |
+| Windows package archive | Native PyInstaller build succeeded; archive integrity verified (335 entries) |
+| Windows package launch/install | Packaged and installed startup smoke tests passed; install, reinstall, shortcut creation, uninstall, and test-data retention passed |
+| Windows artifact checksum | `d5a8da8a8a85e843ac522ce410afc2581b6712f41f9f1558d4ace929c6adabba` |
+| Linux package archive | Requires a native Linux build; not verified from this Windows workspace |
 | HTTP API and permission rules | In-process TestClient tests; application authorization verified, transport not covered by these cases |
 | TLS certificate/IP SAN and cleanup | Automated certificate tests |
 | HTTPS and WSS | Embedded Uvicorn loopback tests with ephemeral session certificates |
@@ -162,12 +169,12 @@ this limitation.
 | Windows/Linux physical communication | Not verified in this workspace |
 | mDNS multicast and firewall traversal | Not verified on physical devices |
 | Linux hotspot hardware | Not verified; adapter tests are mocked |
-| Windows hotspot hardware | Unavailable in the current unpackaged development build |
+| Windows hotspot hardware | Unavailable in the classic desktop package because Windows package identity/capability is required |
 
 Loopback TLS verifies local protocol integration. It does not establish that a
 physical Windows/Linux pair can communicate through a specific router or firewall.
 The self-signed fingerprint must be compared independently to authenticate the host.
-TLS is transport encryption only; Version 0.7 does not implement end-to-end
+TLS is transport encryption only; Version 1.0.0 does not implement end-to-end
 encryption or persistent peer trust. Linux runtime behavior, native notifications,
 physical Windows/Linux networking, multicast discovery, and hotspot hardware remain
 unverified in this workspace.

@@ -82,7 +82,9 @@ class NotificationManager:
         try:
             if self._tray is None:
                 application = QApplication.instance()
-                icon = application.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon) if application else None
+                icon = application.windowIcon() if application else None
+                if application is not None and (icon is None or icon.isNull()):
+                    icon = application.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
                 self._tray = QSystemTrayIcon(icon, self.parent)
                 self._tray.setToolTip("ShareSpace session notifications")
                 self._tray.show()

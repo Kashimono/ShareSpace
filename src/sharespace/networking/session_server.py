@@ -16,6 +16,7 @@ from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from sharespace import __version__
 from sharespace.core.file_manager import FileAccessError
 from sharespace.core.models import (
     ApiError,
@@ -89,7 +90,7 @@ def create_session_app(
 
     app = FastAPI(
         title="ShareSpace Local Session API",
-        version="0.7.0",
+        version=__version__,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
